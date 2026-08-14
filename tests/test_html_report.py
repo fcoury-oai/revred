@@ -137,6 +137,39 @@ class HtmlReportTests(unittest.TestCase):
         self.assertIn("3.2k", document)
         self.assertIn("1.1k cached", document)
 
+    def test_pull_request_identity_and_exact_base_are_visible(self) -> None:
+        session = deepcopy(self.session)
+        session["pull_request"] = {
+            "repository": "openai/codex",
+            "number": 123,
+            "url": "https://github.com/openai/codex/pull/123",
+            "title": "Preserve caller contracts",
+            "base_ref": "stacked/parent",
+        }
+
+        document = render_html_report(self.report, session)
+
+        self.assertIn("openai/codex#123", document)
+        self.assertIn("Preserve caller contracts", document)
+        self.assertIn("stacked/parent", document)
+        self.assertIn('href="https://github.com/openai/codex/pull/123"', document)
+
+    def test_untrusted_pull_request_urls_are_never_rendered_as_links(self) -> None:
+        session = deepcopy(self.session)
+        session["pull_request"] = {
+            "repository": "openai/codex",
+            "number": 123,
+            "url": "javascript:alert(1)",
+            "title": '<script>alert("unsafe")</script>',
+            "base_ref": "main",
+        }
+
+        document = render_html_report(self.report, session)
+
+        self.assertNotIn('href="javascript:', document)
+        self.assertNotIn("<script>", document)
+        self.assertIn("&lt;script&gt;", document)
+
     def test_document_is_offline_safe_and_escapes_untrusted_content(self) -> None:
         session = deepcopy(self.session)
         session["findings"][0]["finding"]["title"] = (

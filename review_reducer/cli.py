@@ -14,6 +14,7 @@ from review_reducer.errors import ReviewReducerError
 from review_reducer.followups import ask_finding
 from review_reducer.html_report import write_html_report
 from review_reducer.policy import ReviewPolicy
+from review_reducer.pull_requests import PullRequestTarget, prepare_pull_request
 from review_reducer.sessions import format_session, list_sessions, resolve_session
 from review_reducer.workflow import RunConfig, ReviewWorkflow, format_report
 
@@ -72,8 +73,20 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     review = commands.add_parser("review", help="review or conservatively repair a Git branch")
-    _add_repository_option(review)
-    review.add_argument("--base", default="origin/main", help="base branch or commit")
+    review.add_argument(
+        "--repo",
+        type=Path,
+        default=None,
+        metavar="PATH|OWNER/REPO",
+        help="local Git checkout, or GitHub owner/repository when used with --pr",
+    )
+    review.add_argument(
+        "--pr",
+        metavar="NUMBER|OWNER/REPO#NUMBER|URL",
+        help="review the exact current head and base of this GitHub pull request",
+    )
+    review.add_argument("--gh-bin", default="gh", help=argparse.SUPPRESS)
+    review.add_argument("--base", default=None, help="base branch or commit (default: origin/main)")
     review.add_argument("--mode", choices=("review", "fix"), default="review")
     review.add_argument("--artifacts-dir", type=Path)
     review.add_argument("--review-file", type=Path, help="reuse an existing native review")
@@ -160,10 +173,17 @@ def _validate_execution_options(
         parser.error("--check is only available with --mode fix")
 
 
-def _run_config(options: argparse.Namespace, *, base: str, mode: str) -> RunConfig:
+def _run_config(
+    options: argparse.Namespace,
+    *,
+    base: str,
+    mode: str,
+    pull_request: PullRequestTarget | None = None,
+) -> RunConfig:
     return RunConfig(
         repo=options.repo.resolve(),
         base=base,
+        pull_request=pull_request,
         mode=mode,
         artifacts_dir=getattr(options, "artifacts_dir", None),
         review_file=getattr(options, "review_file", None),
@@ -348,7 +368,22 @@ def main(argv: list[str] | None = None) -> int:
         if options.command == "session":
             return _session_command(parser, options)
         _validate_execution_options(parser, options)
-        config = _run_config(options, base=options.base, mode=options.mode)
+        target = None
+        if options.pr:
+            if options.base:
+                parser.error("--base cannot be combined with --pr; its exact GitHub base is used")
+            prepared = prepare_pull_request(
+                options.pr,
+                repository=options.repo,
+                gh_binary=options.gh_bin,
+            )
+            options.repo = prepared.checkout
+            target = prepared.target
+            base = target.base_sha
+        else:
+            options.repo = options.repo or Path.cwd()
+            base = options.base or "origin/main"
+        config = _run_config(options, base=base, mode=options.mode, pull_request=target)
         return _emit_report(
             ReviewWorkflow(config).run(),
             as_json=options.json,

@@ -15,8 +15,26 @@ Run the checkout directly:
 ./review-reducer review --repo ~/code/my-project --base origin/main
 ```
 
+Review a GitHub pull request directly instead of locating its branch yourself:
+
+```sh
+./review-reducer review --pr openai/codex#123
+./review-reducer review --repo openai/codex --pr 123
+./review-reducer review --repo ~/code/codex --pr 123
+./review-reducer review --pr https://github.com/openai/codex/pull/123
+```
+
+PR mode uses your authenticated `gh` CLI to pin GitHub's exact head and base
+commits, including forked and stacked pull requests. It reuses an existing clean
+worktree at the exact PR head, or creates a durable detached sibling such as
+`~/code/codex.review-pr-123-abc123def456`. Your existing checkout and current
+branch are never switched. The repository must already exist locally; pass its
+path with `--repo` when it is not under `~/code`. PR identity, title, branches,
+and pinned commits are preserved in the saved session and HTML report.
+
 For a stacked pull request, set `--base` to its immediate parent branch instead
-of `origin/main`; otherwise inherited parent changes can produce false findings.
+of `origin/main` in local-checkout mode; otherwise inherited parent changes can
+produce false findings. GitHub PR mode selects the actual PR base automatically.
 
 Every P0–P3 finding gets the same evidence-grounded review. Priority is retained
 as useful context, but never excludes an issue from investigation. The command

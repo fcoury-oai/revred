@@ -41,6 +41,7 @@ from review_reducer.prompts import (
     fix_prompt,
     reviewer_reply_prompt,
 )
+from review_reducer.pull_requests import PullRequestTarget
 from review_reducer.sessions import ReviewSession
 
 
@@ -59,6 +60,7 @@ _REBUTTAL_ASSESSMENTS = {
 class RunConfig:
     repo: Path
     base: str = "origin/main"
+    pull_request: PullRequestTarget | None = None
     mode: str = "review"
     artifacts_dir: Path | None = None
     review_file: Path | None = None
@@ -461,6 +463,20 @@ class ReviewWorkflow:
     def _execute(self) -> dict[str, Any]:
         self.snapshot = capture_snapshot(self.config.repo, self.config.base)
         snapshot = self._snapshot()
+        if self.config.pull_request is not None:
+            target = self.config.pull_request
+            if snapshot.head_sha != target.head_sha:
+                raise ReviewReducerError(
+                    "the selected checkout no longer matches the exact GitHub PR head"
+                )
+            if snapshot.base_sha != target.base_sha:
+                raise ReviewReducerError(
+                    "the selected checkout no longer contains the exact GitHub PR base"
+                )
+            if snapshot.dirty_paths or snapshot.untracked_paths:
+                raise ReviewReducerError(
+                    "GitHub pull-request review requires a clean exact-head worktree"
+                )
         self.display.configure(snapshot, self.config.mode)
         self.expected_patch = snapshot.patch_sha256
         self.expected_untracked = snapshot.untracked_paths
@@ -471,7 +487,12 @@ class ReviewWorkflow:
             )
         self.run_dir = _create_run_dir(self.config, snapshot)
         _write_json(self._run_dir() / "snapshot.json", snapshot.to_dict())
-        self.session = ReviewSession.create(self._run_dir(), snapshot, self.config.mode)
+        self.session = ReviewSession.create(
+            self._run_dir(),
+            snapshot,
+            self.config.mode,
+            pull_request=self.config.pull_request.to_dict() if self.config.pull_request else None,
+        )
         self.runner = self._create_runner()
         self.display.note(
             f"reviewing pinned head {snapshot.head_sha[:12]}", stage="review"
@@ -490,6 +511,8 @@ class ReviewWorkflow:
             "final_decisions": [],
             "artifacts_dir": str(self._run_dir()),
         }
+        if self.config.pull_request is not None:
+            report["pull_request"] = self.config.pull_request.to_dict()
 
         if self.config.mode != "fix" or report["status"] != "action_required":
             return self._finish(report)
@@ -598,14 +621,25 @@ class ReviewWorkflow:
 
 def format_report(report: dict[str, Any]) -> str:
     snapshot = report["snapshot"]
+    pull_request = report.get("pull_request")
+    base = (
+        str(pull_request["base_ref"])
+        if isinstance(pull_request, dict)
+        else str(snapshot["base_ref"])
+    )
     lines = [
         f"Review reducer: {report['status']}",
         f"Session: {report.get('session_id', Path(report['artifacts_dir']).name)}",
         f"Repository: {snapshot['repo_root']}",
-        f"Base: {snapshot['base_ref']} ({snapshot['merge_base_sha'][:12]})",
+        f"Base: {base} ({snapshot['base_sha'][:12]})",
         f"Head: {snapshot['head_sha'][:12]}",
-        f"Initial findings: {len(report['initial_findings'])}",
     ]
+    if isinstance(pull_request, dict):
+        lines.append(
+            f"Pull request: {pull_request['repository']}#{pull_request['number']} "
+            f"({pull_request['url']})"
+        )
+    lines.append(f"Initial findings: {len(report['initial_findings'])}")
     for decision in report["initial_decisions"]:
         finding = decision["finding"]
         lines.append(

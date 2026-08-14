@@ -150,6 +150,7 @@ def _legacy_session(run_dir: Path) -> dict[str, Any]:
         "html_report": report.get("html_report", ""),
         "artifacts_dir": str(run_dir),
         "report_path": str(run_dir / "report.json"),
+        "pull_request": report.get("pull_request"),
     }
 
 
@@ -163,7 +164,14 @@ class ReviewSession:
         self._lock = threading.RLock()
 
     @classmethod
-    def create(cls, run_dir: Path, snapshot: Snapshot, mode: str) -> "ReviewSession":
+    def create(
+        cls,
+        run_dir: Path,
+        snapshot: Snapshot,
+        mode: str,
+        *,
+        pull_request: dict[str, Any] | None = None,
+    ) -> "ReviewSession":
         now = _timestamp()
         session = cls(
             run_dir,
@@ -183,6 +191,7 @@ class ReviewSession:
                 "html_report": "",
                 "artifacts_dir": str(run_dir),
                 "report_path": str(run_dir / "report.json"),
+                "pull_request": pull_request,
             },
         )
         session.save()
@@ -472,12 +481,20 @@ def format_session(session: ReviewSession, finding: dict[str, Any] | None = None
         f"Repository: {snapshot.get('repo_root', '')}",
         f"Head: {str(snapshot.get('head_sha', ''))[:12]}",
         f"State: {data['state']} / {data['status']}",
+    ]
+    pull_request = data.get("pull_request")
+    if isinstance(pull_request, dict):
+        lines.append(
+            f"Pull request: {pull_request['repository']}#{pull_request['number']} "
+            f"({pull_request['url']})"
+        )
+    lines.append(
         "Findings: "
         f"{summary['total']} total, {summary['accepted']} included, "
         f"{summary['rejected']} dismissed, {summary['non_blocking']} non-blocking, "
         f"{summary['resolved']} resolved, "
-        f"{summary['human_review']} human review",
-    ]
+        f"{summary['human_review']} human review"
+    )
     if finding is None:
         for index, entry in enumerate(data["findings"], start=1):
             item = entry["finding"]

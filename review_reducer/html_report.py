@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import shlex
 from typing import Any
+from urllib.parse import urlsplit
 
 from review_reducer.errors import ReviewReducerError
 from review_reducer.git import git_common_dir
@@ -79,6 +80,15 @@ a:hover { text-decoration: underline; }
   line-height: 1.02;
 }
 .hero-copy { max-width: 700px; margin: 0; color: var(--muted); line-height: 1.7; }
+.pr-context {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.pr-context strong { color: var(--ink); font-weight: 590; }
 .status {
   display: inline-flex;
   align-items: center;
@@ -612,6 +622,9 @@ def render_html_report(report: dict[str, Any], session: dict[str, Any]) -> str:
     """Render a complete offline document without extra model turns or scripts."""
 
     snapshot = session.get("snapshot") or report.get("snapshot") or {}
+    pull_request = session.get("pull_request") or report.get("pull_request") or {}
+    if not isinstance(pull_request, dict):
+        pull_request = {}
     summary = session.get("summary") or {}
     usage = report.get("usage") or session.get("usage") or {}
     configured_policy = report.get("policy") or session.get("policy") or {}
@@ -656,14 +669,24 @@ def render_html_report(report: dict[str, Any], session: dict[str, Any]) -> str:
         f'<div class="metric-note">{_text(note)}</div></div>'
         for label, value, note in metric_values
     )
-    details = (
+    comparison = str(pull_request.get("base_ref") or snapshot.get("base_ref", "unknown"))
+    details = [
         ("Repository", Path(str(snapshot.get("repo_root", "repository"))).name),
-        ("Comparison", str(snapshot.get("base_ref", "unknown"))),
+        ("Comparison", comparison),
+        ("Base commit", str(snapshot.get("base_sha", ""))[:12]),
         ("Commit", str(snapshot.get("head_sha", ""))[:12]),
         ("Session", str(session.get("session_id", "unknown"))[:25]),
         ("Model input", _tokens(usage.get("input_tokens"))),
         ("Model output", _tokens(usage.get("output_tokens"))),
-    )
+    ]
+    if pull_request:
+        details.insert(
+            1,
+            (
+                "Pull request",
+                f"{pull_request.get('repository', '')}#{_number(pull_request.get('number'))}",
+            ),
+        )
     snapshot_rows = "".join(
         f'<div class="snapshot-row"><span>{_text(label)}</span>'
         f"<code>{_text(value)}</code></div>"
@@ -684,6 +707,25 @@ def render_html_report(report: dict[str, Any], session: dict[str, Any]) -> str:
     ) or '<div class="panel empty">No review findings were reported.</div>'
     generated = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     title = f"Review reducer · {Path(str(snapshot.get('repo_root', 'repository'))).name}"
+    pr_context = ""
+    if pull_request:
+        label = (
+            f"{pull_request.get('repository', '')}"
+            f"#{_number(pull_request.get('number'))}"
+        )
+        url = str(pull_request.get("url", ""))
+        parsed = urlsplit(url)
+        identity = (
+            f'<a href="{_text(url)}">{_text(label)}</a>'
+            if parsed.scheme == "https" and parsed.netloc.lower() == "github.com"
+            else _text(label)
+        )
+        pr_context = (
+            '<div class="pr-context">'
+            f"{identity}<span>·</span>"
+            f'<strong>{_text(_plain(pull_request.get("title"), 160))}</strong>'
+            "</div>"
+        )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -704,6 +746,7 @@ def render_html_report(report: dict[str, Any], session: dict[str, Any]) -> str:
     <span class="status status-{_text(status)}">{_text(status.replace('_', ' ').upper())}</span>
     <h1>{_text(headline)}</h1>
     <p class="hero-copy">{_text(description)}</p>
+    {pr_context}
     <div class="metrics">{metrics}</div>
     <div class="overview">
       <section class="panel"><h2>Pinned review context</h2>{snapshot_rows}</section>

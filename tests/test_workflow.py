@@ -11,6 +11,7 @@ from unittest import mock
 from review_reducer.cli import main
 from review_reducer.errors import BudgetExceededError, ReviewReducerError
 from review_reducer.policy import ReviewPolicy
+from review_reducer.pull_requests import prepare_pull_request
 from review_reducer.sessions import ReviewSession, list_sessions
 from review_reducer.workflow import RunConfig, ReviewWorkflow
 from tests.support import GitFixture
@@ -211,6 +212,59 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(Path(report["html_report"]).is_file())
         self.assertIn("FIX RECOMMENDED", Path(report["html_report"]).read_text())
         self.assertEqual(report["policy"]["max_added_production_lines"], 20)
+
+    def test_github_pull_request_review_pins_head_base_and_saved_identity(self) -> None:
+        gh, metadata = self.fixture.github_pull_request(number=321, fork=True)
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            code = main([
+                "review", "--repo", str(self.fixture.repo), "--pr", "321",
+                "--gh-bin", str(gh), "--codex-bin", str(self.binary),
+                "--jobs", "1", "--json", "--no-open-report",
+            ])
+
+        self.assertEqual(code, 2)
+        report = json.loads(stdout.getvalue())
+        self.assertEqual(report["pull_request"]["repository"], "openai/codex")
+        self.assertEqual(report["pull_request"]["number"], 321)
+        self.assertTrue(report["pull_request"]["is_fork"])
+        self.assertEqual(report["snapshot"]["head_sha"], metadata["headRefOid"])
+        self.assertEqual(report["snapshot"]["base_sha"], metadata["baseRefOid"])
+        session = ReviewSession.open(Path(report["artifacts_dir"]))
+        self.assertEqual(session.data["pull_request"]["number"], 321)
+        self.assertIn("openai/codex#321", Path(report["html_report"]).read_text())
+        self.assertIn(str(metadata["baseRefOid"]), self.calls()[0]["argv"])
+
+    def test_github_pull_request_review_rejects_checkout_drift(self) -> None:
+        gh, metadata = self.fixture.github_pull_request(number=321)
+        prepared = prepare_pull_request(
+            "321", repository=self.fixture.repo, gh_binary=str(gh)
+        )
+        self.fixture.write("app.py", "def validate(value):\n    return value - 4\n")
+        self.fixture.commit("move pull request head")
+
+        with self.assertRaisesRegex(ReviewReducerError, "exact GitHub PR head"):
+            ReviewWorkflow(
+                self.config(
+                    base=str(metadata["baseRefOid"]),
+                    pull_request=prepared.target,
+                )
+            ).run()
+
+    def test_github_pull_request_review_rejects_dirty_checkout(self) -> None:
+        gh, metadata = self.fixture.github_pull_request(number=321)
+        prepared = prepare_pull_request(
+            "321", repository=self.fixture.repo, gh_binary=str(gh)
+        )
+        self.fixture.write("app.py", "def validate(value):\n    return value + 9\n")
+
+        with self.assertRaisesRegex(ReviewReducerError, "clean exact-head worktree"):
+            ReviewWorkflow(
+                self.config(
+                    base=str(metadata["baseRefOid"]),
+                    pull_request=prepared.target,
+                )
+            ).run()
 
     def test_preexisting_finding_is_rejected_without_repair(self) -> None:
         with mock.patch.dict(os.environ, {"FAKE_ASSESSMENT": "pre_existing"}):

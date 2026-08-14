@@ -449,6 +449,8 @@ class ReviewWorkflow:
         report["usage"] = self._runner().usage_summary()
         report["policy"] = asdict(self.config.policy)
         report["html_report"] = str(self._run_dir() / "report.html")
+        report["reviewed_patch_sha256"] = self.expected_patch
+        report["reviewed_untracked_paths"] = list(self.expected_untracked or ())
         _write_json(self._run_dir() / "report.json", report)
         summary = format_report(report)
         (self._run_dir() / "summary.md").write_text(summary + "\n", encoding="utf-8")

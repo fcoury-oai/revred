@@ -11,6 +11,7 @@ import webbrowser
 
 from review_reducer import __version__
 from review_reducer.errors import ReviewReducerError
+from review_reducer.followups import ask_finding
 from review_reducer.html_report import write_html_report
 from review_reducer.policy import ReviewPolicy
 from review_reducer.sessions import format_session, list_sessions, resolve_session
@@ -103,6 +104,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     html_report.add_argument("--json", action="store_true")
     _add_open_report_option(html_report)
+
+    followup = session_commands.add_parser(
+        "ask", help="ask a focused read-only question about one saved finding"
+    )
+    followup.add_argument("session", help="latest, a session-ID prefix, or a directory")
+    followup.add_argument("finding", help="1-based finding number or finding-ID prefix")
+    followup.add_argument("question", help="the question to answer about this finding")
+    _add_repository_option(followup)
+    followup.add_argument(
+        "--perspective", choices=("neutral", "reviewer", "adversary"), default="neutral"
+    )
+    followup.add_argument("--codex-bin", default="codex")
+    followup.add_argument("--model", help="override the focused follow-up model")
+    followup.add_argument("--reasoning-effort", choices=("low", "medium", "high", "xhigh"))
+    followup.add_argument("--timeout", type=int, default=1200)
+    followup.add_argument("--progress", choices=("auto", "always", "never"), default="auto")
+    followup.add_argument("--json", action="store_true")
+    _add_open_report_option(followup)
 
     for action in ("include", "dismiss", "reset"):
         command = session_commands.add_parser(
@@ -221,6 +240,54 @@ def _session_command(
         return 0
 
     saved = resolve_session(repo, options.session)
+    if options.session_command == "ask":
+        if options.timeout <= 0:
+            parser.error("--timeout must be greater than zero")
+        record = ask_finding(
+            saved,
+            options.finding,
+            options.question,
+            repo=repo,
+            perspective=options.perspective,
+            codex_bin=options.codex_bin,
+            model=options.model,
+            reasoning_effort=options.reasoning_effort,
+            timeout_seconds=options.timeout,
+            progress=options.progress,
+        )
+        if options.json:
+            print(json.dumps(record, indent=2))
+        else:
+            answer = record["response"]
+            print(f"Question: {record['question']}")
+            print(f"Perspective: {record['perspective']}")
+            print("")
+            print(answer["answer"])
+            if answer["recommended_action"].strip():
+                print("")
+                print(f"Recommended action: {answer['recommended_action']}")
+            if answer["smallest_fix"].strip():
+                print(
+                    f"Smallest fix: {answer['smallest_fix']} "
+                    f"({answer['estimated_added_production_lines']} added production lines)"
+                )
+            if answer["source_anchors"]:
+                print("Sources:")
+                for anchor in answer["source_anchors"]:
+                    print(f"  {anchor['path']}:{anchor['line']} — {anchor['explanation']}")
+            if answer["uncertainties"]:
+                print("Uncertainties:")
+                for uncertainty in answer["uncertainties"]:
+                    print(f"  - {uncertainty}")
+            print(f"Confidence: {answer['confidence']:.0%}")
+            print(
+                f"Suggested verdict: {answer['suggested_verdict']} "
+                "(advisory; the saved verdict is unchanged)"
+            )
+            print(f"HTML report: {saved.run_dir / 'report.html'}")
+        _open_report(saved.run_dir / "report.html", options.open_report)
+        return 0
+
     if options.session_command == "report":
         html_path = write_html_report(saved, output=options.output)
         if options.json:

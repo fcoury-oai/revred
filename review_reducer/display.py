@@ -305,9 +305,14 @@ class ProgressDisplay:
             return "final review"
         if label == "repair":
             return "minimal repair"
-        finding_id = label.rsplit("-", maxsplit=1)[-1]
+        if label.startswith("followup-"):
+            finding_id = label.split("-", maxsplit=2)[1]
+        else:
+            finding_id = label.rsplit("-", maxsplit=1)[-1]
         finding = self.state.findings.get(finding_id)
         location = f" · {finding.path}:{finding.line}" if finding else ""
+        if label.startswith("followup-"):
+            return "finding follow-up" + location
         if "-blind-" in label:
             return "blind investigator" + location
         if "-defense-" in label:

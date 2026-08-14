@@ -1,0 +1,47 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "finding_id": {"type": "string"},
+    "answer_status": {
+      "type": "string",
+      "enum": ["answered", "insufficient_evidence"]
+    },
+    "answer": {"type": "string"},
+    "evidence_kind": {
+      "type": "string",
+      "enum": ["source_grounded", "inferred", "hypothetical", "unknown"]
+    },
+    "source_anchors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": {"type": "string"},
+          "line": {"type": "integer"},
+          "explanation": {"type": "string"}
+        },
+        "required": ["path", "line", "explanation"]
+      }
+    },
+    "confidence": {"type": "number"},
+    "suggested_verdict": {
+      "type": "string",
+      "enum": ["unchanged", "accept", "reject", "non_blocking", "human_review"]
+    },
+    "recommended_action": {"type": "string"},
+    "smallest_fix": {"type": "string"},
+    "estimated_added_production_lines": {"type": "integer"},
+    "uncertainties": {
+      "type": "array",
+      "items": {"type": "string"}
+    }
+  },
+  "required": [
+    "finding_id", "answer_status", "answer", "evidence_kind",
+    "source_anchors", "confidence", "suggested_verdict",
+    "recommended_action", "smallest_fix",
+    "estimated_added_production_lines", "uncertainties"
+  ]
+}

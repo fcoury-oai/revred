@@ -93,6 +93,45 @@ review:
 Manual `session include`, `session dismiss`, and `session reset` commands keep
 the session's default HTML report synchronized with your latest decisions.
 
+## Ask follow-up questions about one finding
+
+Ask Codex a focused question about an existing finding without rerunning the
+full review:
+
+```sh
+./review-reducer session ask latest 1 \
+  'Can this be fixed in fewer than 10 production lines?' \
+  --repo ~/code/my-project
+```
+
+Each question uses one fresh, read-only Codex turn with the original finding,
+blind investigation, adversarial assessment, any reviewer rebuttal, and recent
+questions about that same finding. The repository, base, commit, and exact
+tracked patch must still match the saved session. Answers include verified
+source references, confidence, remaining uncertainty, a recommended action,
+and any smaller proposed fix.
+
+Choose a viewpoint when the question calls for it:
+
+```sh
+./review-reducer session ask latest 3 \
+  'Could this concern be safely dismissed?' \
+  --perspective adversary \
+  --repo ~/code/my-project
+
+./review-reducer session ask latest 3 \
+  'What concrete user-visible failure supports this finding?' \
+  --perspective reviewer \
+  --repo ~/code/my-project
+```
+
+The default `neutral` perspective answers without defending either side.
+Questions and answers are appended to the saved finding and immediately appear
+in its standalone HTML report. A suggested verdict is advisory: it never
+changes the review decision unless you explicitly run `session include` or
+`session dismiss`. Use `--model`, `--reasoning-effort`, `--timeout`, `--json`,
+`--progress`, and `--no-open-report` to control the focused turn and its output.
+
 ## Inspect and curate a saved session
 
 Every run immediately creates a durable local session. List the sessions for a

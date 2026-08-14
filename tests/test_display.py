@@ -115,6 +115,16 @@ class ProgressDisplayTests(unittest.TestCase):
         )
         self.assertIn("reviewer rebuttal · src/app.py:12", dashboard.render(width=105))
 
+    def test_followup_agent_names_include_the_finding_location(self) -> None:
+        dashboard = self.display()
+        dashboard.configure(self.snapshot, "review")
+        dashboard.register_findings((self.finding,), phase="initial")
+        dashboard.agent_event(
+            f"followup-{self.finding.finding_id}-001",
+            {"type": "reducer.agent.started"},
+        )
+        self.assertIn("finding follow-up · src/app.py:12", dashboard.render(width=105))
+
     def test_model_commentary_is_shown_but_json_is_not(self) -> None:
         dashboard = self.display()
         label = "initial-blind-123"

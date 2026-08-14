@@ -164,6 +164,20 @@ a:hover { text-decoration: underline; }
 }
 .recommendation .label { color: var(--violet); }
 .recommendation p { margin: 7px 0 0; font-size: 13px; line-height: 1.7; }
+.followups {
+  margin-top: 19px;
+  padding: 16px 17px;
+  border: 1px solid rgba(115, 216, 233, .18);
+  border-radius: 13px;
+  background: rgba(115, 216, 233, .045);
+}
+.followups > summary { color: var(--cyan); }
+.followup-item { margin-top: 16px; padding-top: 15px; border-top: 1px solid var(--border); }
+.followup-item:first-of-type { border-top: 0; }
+.followup-meta { margin-bottom: 8px; color: var(--muted); font-size: 10px; }
+.followup-item h3 { margin: 0 0 8px; font-size: 13px; line-height: 1.55; }
+.followup-item p { margin: 0; color: #dce0ee; font-size: 12px; line-height: 1.7; }
+.followup-action { margin-top: 10px !important; color: var(--cyan) !important; }
 details.evidence { margin-top: 19px; border-top: 1px solid var(--border); padding-top: 15px; }
 details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
 details summary:hover { color: var(--ink); }
@@ -378,6 +392,16 @@ def _source_anchors(entry: dict[str, Any], repo_root: Path) -> str:
                 for anchor in candidate.get("source_anchors", [])
                 if isinstance(anchor, dict)
             )
+    for question in entry.get("questions", []):
+        if not isinstance(question, dict):
+            continue
+        answer = question.get("response")
+        if isinstance(answer, dict):
+            sources.extend(
+                anchor
+                for anchor in answer.get("source_anchors", [])
+                if isinstance(anchor, dict)
+            )
     unique: dict[tuple[str, int], dict[str, Any]] = {}
     for anchor in sources:
         path = str(anchor.get("path", ""))
@@ -408,6 +432,11 @@ def _commands(entry: dict[str, Any], session: dict[str, Any]) -> str:
     verdict = _effective_verdict(entry)
     actions = ("dismiss",) if verdict == "accept" else ("include", "dismiss")
     commands = []
+    ask = [
+        "review-reducer", "session", "ask", session_id, selector,
+        "Ask a focused follow-up question", "--repo", repo,
+    ]
+    commands.append(shlex.join(ask))
     for action in actions:
         arguments = [
             "review-reducer", "session", action, session_id, selector,
@@ -417,6 +446,80 @@ def _commands(entry: dict[str, Any], session: dict[str, Any]) -> str:
     return '<div class="commands"><div class="label">Review controls</div><pre>' + _text(
         "\n".join(commands)
     ) + "</pre></div>"
+
+
+def _followup_conversation(entry: dict[str, Any]) -> str:
+    questions = entry.get("questions") or []
+    if not questions:
+        return ""
+    cards: list[str] = []
+    for item in questions:
+        if not isinstance(item, dict):
+            continue
+        response = item.get("response") or {}
+        perspective = str(item.get("perspective", "neutral")).capitalize()
+        confidence = response.get("confidence")
+        confidence_label = (
+            f" · {confidence:.0%} confidence"
+            if isinstance(confidence, (int, float)) and not isinstance(confidence, bool)
+            else ""
+        )
+        answer = _plain(response.get("answer"), 1_600)
+        recommendation = _plain(response.get("recommended_action"), 420)
+        smallest_fix = _plain(response.get("smallest_fix"), 420)
+        estimate = _number(response.get("estimated_added_production_lines"))
+        verdict = _plain(response.get("suggested_verdict"), 80)
+        uncertainties = [
+            _plain(uncertainty, 320)
+            for uncertainty in (response.get("uncertainties") or [])[:3]
+        ]
+        sources = ", ".join(
+            f"{anchor.get('path', '')}:{_number(anchor.get('line'))}"
+            for anchor in response.get("source_anchors", [])[:5]
+            if isinstance(anchor, dict)
+        )
+        lines = [
+            '<article class="followup-item">',
+            '<div class="followup-meta">'
+            f"{_text(perspective)} perspective{_text(confidence_label)}</div>",
+            f"<h3>{_text(_plain(item.get('question'), 500))}</h3>",
+            f"<p>{_text(answer)}</p>",
+        ]
+        if recommendation:
+            lines.append(
+                '<p class="followup-action">Recommended action: '
+                f"{_text(recommendation)}</p>"
+            )
+        if smallest_fix:
+            lines.append(
+                '<p class="followup-meta">Smallest fix: '
+                f"{_text(smallest_fix)} · {estimate} added production lines</p>"
+            )
+        if verdict and verdict != "unchanged":
+            lines.append(
+                '<p class="followup-meta">Suggested verdict: '
+                f"{_text(verdict)} · advisory only</p>"
+            )
+        if uncertainties:
+            lines.append(
+                '<p class="followup-meta">Uncertainties: '
+                f"{_text('; '.join(uncertainties))}</p>"
+            )
+        if sources:
+            lines.append(
+                '<p class="followup-meta">Sources: '
+                f"{_text(sources)}</p>"
+            )
+        lines.append("</article>")
+        cards.append("".join(lines))
+    count = len(cards)
+    noun = "question" if count == 1 else "questions"
+    return (
+        '<details class="followups" open>'
+        f"<summary>Follow-up {noun} · {count}</summary>"
+        + "".join(cards)
+        + "</details>"
+    )
 
 
 def _finding_card(
@@ -486,6 +589,7 @@ def _finding_card(
     repo_root = Path(str((session.get("snapshot") or {}).get("repo_root", "."))).resolve()
     sources = _source_anchors(entry, repo_root)
     recommendation = _recommendation(entry, challenge, policy)
+    followups = _followup_conversation(entry)
     return (
         f'<article class="panel finding-card" id="finding-{_text(finding_id)}">'
         '<div class="finding-top"><div>'
@@ -497,6 +601,7 @@ def _finding_card(
         f'<div class="finding-grid">{fact_html}</div>'
         '<div class="recommendation"><div class="label">Recommended action</div>'
         f"<p>{_text(recommendation)}</p></div>"
+        f"{followups}"
         '<details class="evidence"><summary>Inspect the full review evidence</summary>'
         f'<div class="evidence-content">{steps}{sources}{_commands(entry, session)}</div>'
         "</details></article>"

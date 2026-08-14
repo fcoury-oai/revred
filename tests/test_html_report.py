@@ -208,6 +208,38 @@ class HtmlReportTests(unittest.TestCase):
         self.assertIn("Nothing is blocking this review.", document)
         self.assertIn("No review findings were reported.", document)
 
+    def test_followup_questions_are_rendered_and_escaped(self) -> None:
+        session = deepcopy(self.session)
+        session["findings"][0]["questions"] = [
+            {
+                "question_id": 1,
+                "perspective": "adversary",
+                "question": "Can <script>this</script> be fixed with fewer lines?",
+                "response": {
+                    "answer": "Yes. An inline clamp fixes the changed caller.",
+                    "recommended_action": "Use the existing validation expression.",
+                    "smallest_fix": "return max(value - 1, 0)",
+                    "estimated_added_production_lines": 1,
+                    "suggested_verdict": "reject",
+                    "uncertainties": ["<script>runtime reproduction unavailable</script>"],
+                    "confidence": 0.94,
+                    "source_anchors": [
+                        {"path": "app.py", "line": 2, "explanation": "changed return"}
+                    ],
+                },
+            }
+        ]
+        document = render_html_report(self.report, session)
+        self.assertIn("Follow-up question · 1", document)
+        self.assertIn("Adversary perspective", document)
+        self.assertIn("94% confidence", document)
+        self.assertIn("&lt;script&gt;this&lt;/script&gt;", document)
+        self.assertNotIn("<script>", document)
+        self.assertIn("Use the existing validation expression.", document)
+        self.assertIn("Smallest fix: return max(value - 1, 0)", document)
+        self.assertIn("Suggested verdict: reject · advisory only", document)
+        self.assertIn("&lt;script&gt;runtime reproduction unavailable&lt;/script&gt;", document)
+
 
 class BrowserOpeningTests(unittest.TestCase):
     def setUp(self) -> None:

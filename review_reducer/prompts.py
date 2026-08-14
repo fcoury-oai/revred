@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from review_reducer.models import Challenge, Decision, Finding, Observation, Snapshot
 
@@ -165,6 +166,86 @@ intent-preserving direct fix. Do not defend a claim just because you originally
 made it, and do not drop it merely because of its priority or the other model's
 confidence. Mark human_required when the disagreement cannot be resolved from
 the available source. Return the required challenge JSON and exact finding_id.
+"""
+
+
+def followup_prompt(
+    snapshot: Snapshot,
+    entry: dict[str, Any],
+    question: str,
+    perspective: str,
+) -> str:
+    """Focus one fresh source-grounded Codex turn on an existing finding."""
+
+    finding = entry.get("finding") or {}
+    decision = entry.get("decision") or {}
+    investigations = entry.get("investigations") or {}
+    phase = investigations.get("final") or investigations.get("initial") or {}
+    context = {
+        "finding": finding,
+        "verdict": decision.get("verdict"),
+        "decision_reason": decision.get("reason"),
+        "resolved": bool(entry.get("resolved", False)),
+        "final_assessment": decision.get("challenge"),
+        "blind_observation": phase.get("observation"),
+        "adversarial_assessment": phase.get("adversary"),
+        "reviewer_rebuttal": phase.get("reviewer_response"),
+        "manual_override": entry.get("manual_override"),
+        "previous_questions": [
+            {
+                "question": previous.get("question"),
+                "perspective": previous.get("perspective"),
+                "answer": (previous.get("response") or {}).get("answer"),
+            }
+            for previous in (entry.get("questions") or [])[-3:]
+            if isinstance(previous, dict)
+        ],
+    }
+    role = {
+        "neutral": (
+            "Answer impartially. Explain what the evidence actually establishes "
+            "without defending or attacking the existing verdict."
+        ),
+        "reviewer": (
+            "Represent the original reviewer fairly. Explain the strongest "
+            "source-grounded case for keeping the finding, but concede unsupported claims."
+        ),
+        "adversary": (
+            "Represent the skeptical adversary fairly. Test whether the concern "
+            "is inherited, unreachable, speculative, disproportionate, or avoidable "
+            "with a smaller direct fix, without manufacturing disagreement."
+        ),
+    }[perspective]
+    return f"""You are answering one focused follow-up question about a saved code-review finding.
+
+{_SAFETY}
+
+Perspective: {perspective}
+{role}
+
+Pinned repository state:
+- repository: {snapshot.repo_root}
+- reviewed head: {snapshot.head_sha}
+- reviewed merge base: {snapshot.merge_base_sha}
+- tracked patch fingerprint: {snapshot.patch_sha256}
+
+Existing finding and its evidence:
+
+{_json(context)}
+
+User's follow-up question:
+
+{_json(question)}
+
+Answer this question directly. Inspect only source and exact-base history
+necessary to resolve it. Distinguish source_grounded reasoning from inferred,
+hypothetical, or unknown claims; do not call static inspection observed runtime
+evidence. Include concrete source anchors for source-grounded conclusions.
+Suggest a smaller intent-preserving fix when relevant and estimate its added
+production lines. Report insufficient_evidence when the source does not settle
+the question. A suggested verdict is advisory only and must never directly
+change the saved review decision. Return only the required followup JSON with
+the exact finding_id.
 """
 
 

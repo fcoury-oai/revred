@@ -97,6 +97,39 @@ elif schema == "challenge.json":
     if os.environ.get("FAKE_INVALID_SCHEMA"):
         payload["requires_new_dependency"] = "false"
     response = json.dumps(payload)
+elif schema == "followup.json":
+    source = dict(anchor)
+    anchor_mode = os.environ.get("FAKE_FOLLOWUP_ANCHOR", "valid")
+    if anchor_mode == "outside":
+        source["path"] = "/etc/passwd"
+    elif anchor_mode == "missing":
+        source["path"] = "missing.py"
+    elif anchor_mode == "bad_line":
+        source["line"] = 999
+    response = json.dumps({
+        "finding_id": (
+            "not-the-same-finding" if os.environ.get("FAKE_FOLLOWUP_WRONG_ID") else finding_id
+        ),
+        "answer_status": os.environ.get("FAKE_FOLLOWUP_STATUS", "answered"),
+        "answer": os.environ.get(
+            "FAKE_FOLLOWUP_ANSWER",
+            "Yes. The changed validation reaches an existing caller, and a one-line clamp preserves its intent.",
+        ),
+        "evidence_kind": os.environ.get("FAKE_FOLLOWUP_EVIDENCE", "source_grounded"),
+        "source_anchors": [] if anchor_mode == "none" else [source],
+        "confidence": float(os.environ.get("FAKE_FOLLOWUP_CONFIDENCE", "0.96")),
+        "suggested_verdict": os.environ.get("FAKE_FOLLOWUP_VERDICT", "unchanged"),
+        "recommended_action": "Clamp the existing return expression.",
+        "smallest_fix": "return max(value - 1, 0)",
+        "estimated_added_production_lines": int(os.environ.get("FAKE_FOLLOWUP_LINES", "1")),
+        "uncertainties": [],
+    })
+    if os.environ.get("FAKE_FOLLOWUP_INVALID_SCHEMA"):
+        payload = json.loads(response)
+        del payload["answer"]
+        response = json.dumps(payload)
+    if os.environ.get("FAKE_FOLLOWUP_DRIFT"):
+        Path("app.py").write_text("def validate(value):\n    return value + 4\n")
 elif schema == "fix.json":
     mode = os.environ.get("FAKE_REPAIR", "normal")
     source = Path("app.py")
@@ -474,6 +507,207 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.calls(), original_calls)
         self.assertIn("Blind investigation", output.read_text())
         self.assertIn(report["session_id"], output.read_text())
+
+    def ask(self, question: str, *options: str) -> tuple[int, str]:
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            code = main([
+                "session", "ask", "latest", "1", question,
+                "--repo", str(self.fixture.repo),
+                "--codex-bin", str(self.binary),
+                "--no-open-report", *options,
+            ])
+        return code, stdout.getvalue()
+
+    def test_followup_answer_is_persisted_without_changing_the_verdict(self) -> None:
+        report = ReviewWorkflow(self.config()).run()
+        code, output = self.ask("Can this be fixed in one line?")
+        self.assertEqual(code, 0)
+        self.assertIn("one-line clamp", output)
+        self.assertIn("saved verdict is unchanged", output)
+        saved = ReviewSession.open(Path(report["artifacts_dir"]))
+        entry = saved.data["findings"][0]
+        self.assertEqual(entry["decision"]["verdict"], "accept")
+        self.assertEqual(len(entry["questions"]), 1)
+        self.assertEqual(entry["questions"][0]["question"], "Can this be fixed in one line?")
+        self.assertEqual(entry["questions"][0]["perspective"], "neutral")
+        self.assertEqual(entry["history"][-1]["action"], "question")
+        self.assertEqual([call["schema"] for call in self.calls()], [
+            None, "observation.json", "challenge.json", "followup.json"
+        ])
+        document = Path(report["html_report"]).read_text()
+        self.assertIn("Follow-up question · 1", document)
+        self.assertIn("Can this be fixed in one line?", document)
+        self.assertIn("one-line clamp", document)
+
+    def test_followup_can_explain_a_resolved_finding_after_guarded_repair(self) -> None:
+        report = ReviewWorkflow(self.config(mode="fix")).run()
+        original = ReviewSession.open(Path(report["artifacts_dir"]))
+        self.assertTrue(original.data["findings"][0]["resolved"])
+
+        code, output = self.ask("Why does the repaired return resolve this finding?")
+
+        self.assertEqual(code, 0)
+        self.assertIn("one-line clamp", output)
+        entry = ReviewSession.open(Path(report["artifacts_dir"])).data["findings"][0]
+        self.assertTrue(entry["resolved"])
+        self.assertEqual(len(entry["questions"]), 1)
+        self.assertEqual(self.calls()[-1]["schema"], "followup.json")
+        finding_id = entry["finding"]["finding_id"]
+        prompt = Path(
+            report["artifacts_dir"], f"followup-{finding_id}-001.prompt.txt"
+        ).read_text()
+        self.assertIn('"resolved": true', prompt)
+
+    def test_followup_perspectives_and_prior_questions_are_preserved(self) -> None:
+        report = ReviewWorkflow(self.config()).run()
+        first, _ = self.ask("Could this be inherited?", "--perspective", "adversary")
+        second, _ = self.ask("Why should we keep it?", "--perspective", "reviewer")
+        self.assertEqual((first, second), (0, 0))
+        saved = ReviewSession.open(Path(report["artifacts_dir"]))
+        questions = saved.data["findings"][0]["questions"]
+        self.assertEqual([item["perspective"] for item in questions], ["adversary", "reviewer"])
+        self.assertEqual([item["question_id"] for item in questions], [1, 2])
+        finding_id = saved.data["findings"][0]["finding"]["finding_id"]
+        first_prompt = Path(
+            report["artifacts_dir"], f"followup-{finding_id}-001.prompt.txt"
+        ).read_text()
+        second_prompt = Path(
+            report["artifacts_dir"], f"followup-{finding_id}-002.prompt.txt"
+        ).read_text()
+        self.assertIn("Perspective: adversary", first_prompt)
+        self.assertIn("Perspective: reviewer", second_prompt)
+        self.assertIn("Could this be inherited?", second_prompt)
+        self.assertIn("Follow-up questions · 2", Path(report["html_report"]).read_text())
+
+    def test_followup_json_is_machine_readable_and_updates_usage(self) -> None:
+        report = ReviewWorkflow(self.config()).run()
+        code, output = self.ask("Where is the changed return?", "--json")
+        self.assertEqual(code, 0)
+        payload = json.loads(output)
+        self.assertEqual(payload["question"], "Where is the changed return?")
+        self.assertEqual(payload["response"]["source_anchors"][0]["path"], "app.py")
+        saved = ReviewSession.open(Path(report["artifacts_dir"]))
+        self.assertEqual(saved.data["usage"]["turn_count"], 4)
+        persisted_report = json.loads(
+            Path(report["artifacts_dir"], "report.json").read_text()
+        )
+        self.assertEqual(persisted_report["usage"]["turn_count"], 4)
+
+    def test_followup_uses_a_fresh_read_only_turn_and_requested_model(self) -> None:
+        ReviewWorkflow(self.config()).run()
+        code, _ = self.ask(
+            "Which source establishes the caller contract?",
+            "--model", "focused-review-model",
+            "--reasoning-effort", "high",
+            "--progress", "never",
+        )
+
+        self.assertEqual(code, 0)
+        argv = self.calls()[-1]["argv"]
+        self.assertEqual(argv[argv.index("--sandbox") + 1], "read-only")
+        self.assertEqual(argv[argv.index("--model") + 1], "focused-review-model")
+        self.assertIn("model_reasoning_effort=\"high\"", argv)
+        self.assertIn("--ephemeral", argv)
+
+    def test_followup_does_not_reclassify_finding_without_manual_override(self) -> None:
+        report = ReviewWorkflow(self.config()).run()
+        with mock.patch.dict(os.environ, {"FAKE_FOLLOWUP_VERDICT": "reject"}):
+            code, output = self.ask("Should this be dismissed?", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output)["response"]["suggested_verdict"], "reject")
+        saved = ReviewSession.open(Path(report["artifacts_dir"]))
+        self.assertEqual(saved.data["findings"][0]["decision"]["verdict"], "accept")
+        self.assertIsNone(saved.data["findings"][0]["manual_override"])
+
+    def test_followup_refuses_a_changed_head_before_invoking_codex(self) -> None:
+        ReviewWorkflow(self.config()).run()
+        original_calls = self.calls()
+        self.fixture.write("app.py", "def validate(value):\n    return value - 2\n")
+        self.fixture.commit("change reviewed head")
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", stderr):
+            code, _ = self.ask("Does the original issue still happen?")
+        self.assertEqual(code, 1)
+        self.assertIn("no longer matches", stderr.getvalue())
+        self.assertEqual(self.calls(), original_calls)
+
+    def test_followup_refuses_a_changed_working_tree(self) -> None:
+        ReviewWorkflow(self.config()).run()
+        original_calls = self.calls()
+        self.fixture.write("app.py", "def validate(value):\n    return value + 8\n")
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", stderr):
+            code, _ = self.ask("Does this still reach callers?")
+        self.assertEqual(code, 1)
+        self.assertIn("reviewed tracked patch", stderr.getvalue())
+        self.assertEqual(self.calls(), original_calls)
+
+    def test_followup_rejects_unsafe_or_invalid_source_anchors(self) -> None:
+        for anchor in ("outside", "missing", "bad_line", "none"):
+            with self.subTest(anchor=anchor):
+                fixture = GitFixture()
+                try:
+                    binary = fixture.root / "fake-codex"
+                    binary.write_text(_FAKE_CODEX, encoding="utf-8")
+                    binary.chmod(0o755)
+                    state = fixture.root / "state.json"
+                    with mock.patch.dict(
+                        os.environ,
+                        {"FAKE_CODEX_STATE": str(state), "FAKE_FOLLOWUP_ANCHOR": anchor},
+                    ):
+                        report = ReviewWorkflow(
+                            RunConfig(repo=fixture.repo, base="main", codex_bin=str(binary), jobs=1)
+                        ).run()
+                        stderr = io.StringIO()
+                        stdout = io.StringIO()
+                        with mock.patch("sys.stderr", stderr), redirect_stdout(stdout):
+                            code = main([
+                                "session", "ask", "latest", "1", "Check the source",
+                                "--repo", str(fixture.repo), "--codex-bin", str(binary),
+                                "--no-open-report",
+                            ])
+                        self.assertEqual(code, 1)
+                        saved = ReviewSession.open(Path(report["artifacts_dir"]))
+                        self.assertEqual(saved.data["findings"][0].get("questions", []), [])
+                finally:
+                    fixture.cleanup()
+
+    def test_followup_rejects_malformed_output_and_mismatched_identifiers(self) -> None:
+        for variable in ("FAKE_FOLLOWUP_INVALID_SCHEMA", "FAKE_FOLLOWUP_WRONG_ID"):
+            with self.subTest(variable=variable):
+                report = ReviewWorkflow(self.config()).run()
+                with mock.patch.dict(os.environ, {variable: "1"}):
+                    stderr = io.StringIO()
+                    with mock.patch("sys.stderr", stderr):
+                        code, _ = self.ask("Can we prove this?")
+                self.assertEqual(code, 1)
+                saved = ReviewSession.open(Path(report["artifacts_dir"]))
+                self.assertEqual(saved.data["findings"][0].get("questions", []), [])
+                self.state.write_text("[]", encoding="utf-8")
+
+    def test_followup_rejects_invalid_confidence_without_saving_an_answer(self) -> None:
+        report = ReviewWorkflow(self.config()).run()
+        with mock.patch.dict(os.environ, {"FAKE_FOLLOWUP_CONFIDENCE": "1.2"}):
+            stderr = io.StringIO()
+            with mock.patch("sys.stderr", stderr):
+                code, _ = self.ask("How certain is the source evidence?")
+
+        self.assertEqual(code, 1)
+        self.assertIn("confidence must be between zero and one", stderr.getvalue())
+        saved = ReviewSession.open(Path(report["artifacts_dir"]))
+        self.assertEqual(saved.data["findings"][0].get("questions", []), [])
+
+    def test_followup_detects_source_drift_during_the_model_turn(self) -> None:
+        report = ReviewWorkflow(self.config()).run()
+        with mock.patch.dict(os.environ, {"FAKE_FOLLOWUP_DRIFT": "1"}):
+            stderr = io.StringIO()
+            with mock.patch("sys.stderr", stderr):
+                code, _ = self.ask("Can this be simplified?")
+        self.assertEqual(code, 1)
+        self.assertIn("tracked working-tree patch changed", stderr.getvalue())
+        saved = ReviewSession.open(Path(report["artifacts_dir"]))
+        self.assertEqual(saved.data["findings"][0].get("questions", []), [])
 
     def test_html_report_cannot_dirty_reviewed_working_tree(self) -> None:
         ReviewWorkflow(self.config()).run()

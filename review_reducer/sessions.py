@@ -94,6 +94,7 @@ def _legacy_session(run_dir: Path) -> dict[str, Any]:
             "decision": None,
             "manual_override": None,
             "history": [],
+            "questions": [],
         }
     for phase in ("initial", "final"):
         for decision in report.get(f"{phase}_decisions", []):
@@ -109,6 +110,7 @@ def _legacy_session(run_dir: Path) -> dict[str, Any]:
                     "decision": None,
                     "manual_override": None,
                     "history": [],
+                    "questions": [],
                 },
             )
             if phase not in entry["phases"]:
@@ -239,9 +241,47 @@ class ReviewSession:
                         "manual_override": None,
                         "history": [],
                         "resolved": False,
+                        "questions": [],
                     }
                 )
             self.save()
+
+    def record_question(
+        self,
+        finding_id: str,
+        *,
+        question: str,
+        perspective: str,
+        response: dict[str, Any],
+        usage: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Append a follow-up without changing the original or effective verdict."""
+
+        with self._lock:
+            entry = self._entry(finding_id)
+            questions = entry.setdefault("questions", [])
+            record = {
+                "question_id": len(questions) + 1,
+                "asked_at": _timestamp(),
+                "finding_id": finding_id,
+                "perspective": perspective,
+                "question": question,
+                "response": response,
+            }
+            questions.append(record)
+            entry["history"].append(
+                {
+                    "at": record["asked_at"],
+                    "phase": "followup",
+                    "action": "question",
+                    "question_id": record["question_id"],
+                    "perspective": perspective,
+                    "question": question,
+                }
+            )
+            self.data["usage"] = usage
+            self.save()
+            return record
 
     def record_investigation(
         self,

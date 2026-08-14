@@ -87,6 +87,27 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(decision.blocks_review)
         self.assertTrue(decision.auto_fix_allowed)
 
+    def test_priority_never_suppresses_confirmed_or_uncertain_findings(self) -> None:
+        for priority in (2, 3):
+            with self.subTest(priority=priority):
+                finding = replace(self.finding, priority=priority)
+                accepted = self.policy.decide(
+                    finding, self.challenge, self.observation, self.snapshot
+                )
+                self.assertEqual(accepted.verdict, Verdict.ACCEPT)
+                uncertain = self.policy.decide(
+                    finding,
+                    replace(
+                        self.challenge,
+                        assessment=Assessment.PRE_EXISTING,
+                        evidence_kind=EvidenceKind.HYPOTHETICAL,
+                        source_anchors=(),
+                    ),
+                    self.observation,
+                    self.snapshot,
+                )
+                self.assertEqual(uncertain.verdict, Verdict.HUMAN_REVIEW)
+
     def test_rejects_source_proven_inherited_behavior(self) -> None:
         decision = self.decide(
             replace(self.challenge, assessment=Assessment.PRE_EXISTING, changed_from_base="no")

@@ -11,6 +11,7 @@ from unittest import mock
 from review_reducer.cli import main
 from review_reducer.errors import BudgetExceededError, ReviewReducerError
 from review_reducer.policy import ReviewPolicy
+from review_reducer.sessions import ReviewSession, list_sessions
 from review_reducer.workflow import RunConfig, ReviewWorkflow
 from tests.support import GitFixture
 
@@ -47,6 +48,11 @@ if native:
         else f"Full review comments:\n\n- [P{priority}] Clamp negative values — "
              f"{Path.cwd() / 'app.py'}:2-2\n  Negative values escape validation.\n"
     )
+    if count == 1 and os.environ.get("FAKE_SECOND_FINDING"):
+        response += (
+            f"\n- [P{priority}] Preserve the validation floor — "
+            f"{Path.cwd() / 'app.py'}:2-2\n  Duplicate negative-value concern.\n"
+        )
 elif schema == "observation.json":
     response = json.dumps({
         "finding_id": finding_id,
@@ -61,7 +67,11 @@ elif schema == "observation.json":
         "uncertainties": [],
     })
 elif schema == "challenge.json":
-    assessment = os.environ.get("FAKE_ASSESSMENT", "confirmed")
+    reviewer = "original code reviewer's evidence-grounded advocate" in prompt
+    assessment = os.environ.get(
+        "FAKE_REVIEWER_ASSESSMENT" if reviewer else "FAKE_ASSESSMENT",
+        os.environ.get("FAKE_ASSESSMENT", "confirmed"),
+    )
     evidence = os.environ.get("FAKE_EVIDENCE", "source_grounded")
     payload = {
         "finding_id": finding_id,
@@ -70,7 +80,7 @@ elif schema == "challenge.json":
         "rationale": "The changed return expression reaches existing callers.",
         "reachable": "yes",
         "changed_from_base": "no" if assessment == "pre_existing" else "yes",
-        "impact": "high",
+        "impact": os.environ.get("FAKE_IMPACT", "high"),
         "evidence_kind": evidence,
         "source_anchors": [anchor] if evidence == "source_grounded" else [],
         "realistic_trigger": "validate(0)",
@@ -171,7 +181,41 @@ class WorkflowTests(unittest.TestCase):
             report = ReviewWorkflow(self.config(mode="fix")).run()
         self.assertEqual(report["status"], "clean")
         self.assertEqual(report["initial_decisions"][0]["verdict"], "reject")
+        self.assertEqual(len(self.calls()), 4)
+        decision = report["initial_decisions"][0]
+        self.assertEqual(decision["adversarial_challenge"]["assessment"], "pre_existing")
+        self.assertEqual(decision["reviewer_response"]["assessment"], "pre_existing")
+
+    def test_reviewer_can_defend_a_finding_the_adversary_wants_to_drop(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "FAKE_ASSESSMENT": "pre_existing",
+                "FAKE_REVIEWER_ASSESSMENT": "confirmed",
+            },
+        ):
+            report = ReviewWorkflow(self.config()).run()
+        decision = report["initial_decisions"][0]
+        self.assertEqual(report["status"], "action_required")
+        self.assertEqual(decision["adversarial_challenge"]["assessment"], "pre_existing")
+        self.assertEqual(decision["reviewer_response"]["assessment"], "confirmed")
+        self.assertEqual(decision["verdict"], "accept")
+        self.assertEqual(len(self.calls()), 4)
+
+    def test_confirmed_findings_do_not_trigger_a_manufactured_rebuttal(self) -> None:
+        report = ReviewWorkflow(self.config()).run()
+        decision = report["initial_decisions"][0]
+        self.assertEqual(decision["adversarial_challenge"]["assessment"], "confirmed")
+        self.assertIsNone(decision["reviewer_response"])
         self.assertEqual(len(self.calls()), 3)
+
+    def test_low_impact_downgrade_gets_a_reviewer_rebuttal(self) -> None:
+        with mock.patch.dict(os.environ, {"FAKE_IMPACT": "low"}):
+            report = ReviewWorkflow(self.config()).run()
+        decision = report["initial_decisions"][0]
+        self.assertEqual(decision["verdict"], "non_blocking")
+        self.assertEqual(decision["reviewer_response"]["assessment"], "confirmed")
+        self.assertEqual(len(self.calls()), 4)
 
     def test_fix_runs_one_batch_and_one_final_review(self) -> None:
         report = ReviewWorkflow(self.config(mode="fix")).run()
@@ -208,12 +252,32 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("Clamp negative values", prompt)
         self.assertNotIn("[P1]", prompt)
 
-    def test_low_priority_findings_do_not_trigger_extra_model_calls(self) -> None:
-        with mock.patch.dict(os.environ, {"FAKE_PRIORITY": "2"}):
+    def test_all_priorities_receive_full_adversarial_review(self) -> None:
+        for priority in ("2", "3"):
+            with self.subTest(priority=priority):
+                self.state.write_text("[]", encoding="utf-8")
+                with mock.patch.dict(os.environ, {"FAKE_PRIORITY": priority}):
+                    report = ReviewWorkflow(self.config()).run()
+                self.assertEqual(report["status"], "action_required")
+                self.assertEqual(report["initial_findings"][0]["priority"], int(priority))
+                self.assertEqual(report["initial_decisions"][0]["verdict"], "accept")
+                self.assertEqual(
+                    [call["schema"] for call in self.calls()],
+                    [None, "observation.json", "challenge.json"],
+                )
+
+    def test_unproven_low_priority_finding_requires_human_review(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "FAKE_PRIORITY": "3",
+                "FAKE_ASSESSMENT": "pre_existing",
+                "FAKE_EVIDENCE": "hypothetical",
+            },
+        ):
             report = ReviewWorkflow(self.config()).run()
-        self.assertEqual(report["status"], "clean")
-        self.assertEqual(report["initial_decisions"][0]["verdict"], "non_blocking")
-        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(report["status"], "human_review_required")
+        self.assertEqual(report["initial_decisions"][0]["verdict"], "human_review")
 
     def test_invalid_structured_output_is_sent_to_human_review(self) -> None:
         with mock.patch.dict(os.environ, {"FAKE_INVALID_SCHEMA": "1"}):
@@ -325,6 +389,154 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("✓ final", dashboard)
         self.assertIn("CLEAN", dashboard)
         self.assertIn("5 source checks", dashboard)
+
+    def test_session_persists_all_finding_evidence(self) -> None:
+        with mock.patch.dict(os.environ, {"FAKE_ASSESSMENT": "pre_existing"}):
+            report = ReviewWorkflow(self.config()).run()
+        session = ReviewSession.open(Path(report["artifacts_dir"]))
+        self.assertEqual(session.data["state"], "complete")
+        self.assertEqual(session.data["session_id"], report["session_id"])
+        investigation = session.data["findings"][0]["investigations"]["initial"]
+        self.assertEqual(investigation["observation"]["changed_behavior"], "Validation subtracts one.")
+        self.assertEqual(investigation["adversary"]["assessment"], "pre_existing")
+        self.assertEqual(investigation["reviewer_response"]["assessment"], "pre_existing")
+        self.assertEqual(session.data["findings"][0]["decision"]["verdict"], "reject")
+
+    def test_saved_session_manual_dismiss_preserves_model_decision(self) -> None:
+        report = ReviewWorkflow(self.config()).run()
+        session = ReviewSession.open(Path(report["artifacts_dir"]))
+        entry = session.override("1", "dismiss", "Already safe on the parent branch")
+        self.assertEqual(entry["decision"]["verdict"], "accept")
+        self.assertEqual(entry["manual_override"]["action"], "dismiss")
+        self.assertEqual(session.data["status"], "clean")
+        self.assertEqual(session.effective_decisions()[0].verdict.value, "reject")
+        self.assertEqual(entry["history"][-1]["action"], "dismiss")
+
+    def test_saved_session_manual_include_and_reset(self) -> None:
+        with mock.patch.dict(os.environ, {"FAKE_ASSESSMENT": "pre_existing"}):
+            report = ReviewWorkflow(self.config()).run()
+        session = ReviewSession.open(Path(report["artifacts_dir"]))
+        finding_id = session.data["findings"][0]["finding"]["finding_id"]
+        session.override(finding_id[:8], "include", "The changed caller exposes it")
+        self.assertEqual(session.data["status"], "action_required")
+        self.assertEqual(session.effective_decisions()[0].verdict.value, "accept")
+        self.assertTrue(session.effective_decisions()[0].auto_fix_allowed)
+        session.override("1", "reset")
+        self.assertEqual(session.data["status"], "clean")
+        self.assertEqual(session.data["findings"][0]["decision"]["verdict"], "reject")
+
+    def test_saved_session_list_and_detail_commands(self) -> None:
+        report = ReviewWorkflow(self.config()).run()
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            code = main(["session", "list", "--repo", str(self.fixture.repo), "--json"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout.getvalue())[0]["session_id"], report["session_id"])
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            code = main([
+                "session", "show", "latest", "--finding", "1",
+                "--repo", str(self.fixture.repo), "--json",
+            ])
+        self.assertEqual(code, 0)
+        entry = json.loads(stdout.getvalue())
+        self.assertEqual(entry["decision"]["verdict"], "accept")
+        self.assertIn("adversary", entry["investigations"]["initial"])
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            code = main([
+                "session", "dismiss", "latest", "1", "--repo", str(self.fixture.repo),
+                "--reason", "Inherited parent behavior", "--json",
+            ])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout.getvalue())["manual_override"]["action"], "dismiss")
+        self.assertEqual(list_sessions(self.fixture.repo)[0].data["status"], "clean")
+
+    def test_saved_session_apply_repairs_curated_finding_once(self) -> None:
+        report = ReviewWorkflow(self.config()).run()
+        saved = ReviewSession.open(Path(report["artifacts_dir"]))
+        final = ReviewWorkflow(self.config(mode="fix")).apply_session(saved)
+        self.assertEqual(final["status"], "clean")
+        self.assertEqual(final["session_id"], report["session_id"])
+        self.assertIn("max(value - 1, 0)", (self.fixture.repo / "app.py").read_text())
+        self.assertEqual(
+            [call["schema"] for call in self.calls()],
+            [None, "observation.json", "challenge.json", "fix.json", None],
+        )
+        persisted = ReviewSession.open(saved.run_dir)
+        self.assertEqual(persisted.data["status"], "clean")
+        self.assertEqual(persisted.data["summary"]["resolved"], 1)
+
+    def test_repair_marks_only_applied_findings_resolved(self) -> None:
+        with mock.patch.dict(os.environ, {"FAKE_SECOND_FINDING": "1"}):
+            report = ReviewWorkflow(self.config(mode="fix")).run()
+        session = ReviewSession.open(Path(report["artifacts_dir"]))
+        self.assertEqual(session.data["summary"]["resolved"], 1)
+        self.assertEqual(session.data["summary"]["rejected"], 1)
+        self.assertEqual(session.data["status"], "clean")
+
+    def test_saved_session_apply_command_uses_curated_session(self) -> None:
+        report = ReviewWorkflow(self.config()).run()
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            code = main([
+                "session", "apply", "latest", "--repo", str(self.fixture.repo),
+                "--codex-bin", str(self.binary), "--jobs", "1", "--json",
+            ])
+        self.assertEqual(code, 0)
+        final = json.loads(stdout.getvalue())
+        self.assertEqual(final["session_id"], report["session_id"])
+        self.assertEqual(final["status"], "clean")
+
+    def test_manually_included_refuted_finding_can_use_its_bounded_fix(self) -> None:
+        with mock.patch.dict(os.environ, {"FAKE_ASSESSMENT": "pre_existing"}):
+            report = ReviewWorkflow(self.config()).run()
+        saved = ReviewSession.open(Path(report["artifacts_dir"]))
+        saved.override("1", "include", "Changed caller now exposes the inherited defect")
+        final = ReviewWorkflow(self.config(mode="fix")).apply_session(saved)
+        self.assertEqual(final["status"], "clean")
+        self.assertEqual(ReviewSession.open(saved.run_dir).data["summary"]["resolved"], 1)
+
+    def test_legacy_session_is_inspectable_but_unverified_include_cannot_apply(self) -> None:
+        report = ReviewWorkflow(self.config()).run()
+        run_dir = Path(report["artifacts_dir"])
+        decision = report["initial_decisions"][0]
+        report["initial_decisions"] = [{
+            "finding": decision["finding"],
+            "verdict": "non_blocking",
+            "reason": "finding is below the configured blocking priority",
+            "challenge": None,
+            "observation": None,
+            "blocks_review": False,
+            "auto_fix_allowed": False,
+        }]
+        (run_dir / "report.json").write_text(json.dumps(report), encoding="utf-8")
+        (run_dir / "session.json").unlink()
+        saved = ReviewSession.open(run_dir)
+        self.assertEqual(saved.data["findings"][0]["decision"]["verdict"], "non_blocking")
+        saved.override("1", "include", "This lower-priority issue matters")
+        with self.assertRaisesRegex(ReviewReducerError, "does not have a verified"):
+            ReviewWorkflow(self.config(mode="fix")).apply_session(saved)
+        self.assertEqual(ReviewSession.open(run_dir).data["state"], "complete")
+
+    def test_saved_session_apply_rejects_changed_head(self) -> None:
+        report = ReviewWorkflow(self.config()).run()
+        saved = ReviewSession.open(Path(report["artifacts_dir"]))
+        self.fixture.write("app.py", "def validate(value):\n    return value - 2\n")
+        self.fixture.commit("change reviewed head")
+        with self.assertRaisesRegex(ReviewReducerError, "no longer matches"):
+            ReviewWorkflow(self.config(mode="fix")).apply_session(saved)
+
+    def test_failed_run_retains_inspectable_session(self) -> None:
+        with mock.patch.dict(os.environ, {"FAKE_REPAIR": "untracked"}):
+            with self.assertRaises(BudgetExceededError):
+                ReviewWorkflow(self.config(mode="fix")).run()
+        saved = list_sessions(self.fixture.repo)[0]
+        self.assertEqual(saved.data["state"], "failed")
+        self.assertIn("untracked files", saved.data["failure"])
+        self.assertEqual(saved.data["findings"][0]["decision"]["verdict"], "accept")
 
 
 if __name__ == "__main__":

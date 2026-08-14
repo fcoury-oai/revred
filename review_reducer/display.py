@@ -312,6 +312,8 @@ class ProgressDisplay:
             return "blind investigator" + location
         if "-defense-" in label:
             return "adversarial review" + location
+        if "-reviewer-" in label:
+            return "reviewer rebuttal" + location
         return label
 
     def _style(self, value: str, color: str) -> str:

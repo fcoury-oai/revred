@@ -105,6 +105,16 @@ class ProgressDisplayTests(unittest.TestCase):
         frame = dashboard.render(width=105)
         self.assertIn("adversarial review · src/app.py:12", frame)
 
+    def test_conditional_reviewer_rebuttal_is_named_in_dashboard(self) -> None:
+        dashboard = self.display()
+        dashboard.configure(self.snapshot, "review")
+        dashboard.register_findings((self.finding,), phase="initial")
+        dashboard.agent_event(
+            f"initial-reviewer-{self.finding.finding_id}",
+            {"type": "reducer.agent.started"},
+        )
+        self.assertIn("reviewer rebuttal · src/app.py:12", dashboard.render(width=105))
+
     def test_model_commentary_is_shown_but_json_is_not(self) -> None:
         dashboard = self.display()
         label = "initial-blind-123"

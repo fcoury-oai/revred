@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import json
 from pathlib import Path
@@ -24,6 +24,7 @@ from review_reducer.git import (
     working_tree_status,
 )
 from review_reducer.models import (
+    Assessment,
     Challenge,
     Decision,
     Finding,
@@ -33,7 +34,24 @@ from review_reducer.models import (
 )
 from review_reducer.parsing import parse_native_review
 from review_reducer.policy import ReviewPolicy
-from review_reducer.prompts import blind_prompt, challenge_prompt, fix_prompt
+from review_reducer.prompts import (
+    blind_prompt,
+    challenge_prompt,
+    fix_prompt,
+    reviewer_reply_prompt,
+)
+from review_reducer.sessions import ReviewSession
+
+
+_REBUTTAL_ASSESSMENTS = {
+    Assessment.PRE_EXISTING,
+    Assessment.INTENTIONAL,
+    Assessment.UNREACHABLE,
+    Assessment.SPECULATIVE,
+    Assessment.DUPLICATE,
+    Assessment.NON_BLOCKING,
+    Assessment.DISPROPORTIONATE,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +126,7 @@ class ReviewWorkflow:
         self.snapshot: Snapshot | None = None
         self.run_dir: Path | None = None
         self.runner: CodexRunner | None = None
+        self.session: ReviewSession | None = None
         self.expected_patch: str | None = None
         self.expected_untracked: tuple[str, ...] | None = None
         self.display = ProgressDisplay(mode=config.progress)
@@ -126,6 +145,24 @@ class ReviewWorkflow:
     def _run_dir(self) -> Path:
         assert self.run_dir is not None
         return self.run_dir
+
+    def _session(self) -> ReviewSession:
+        assert self.session is not None
+        return self.session
+
+    def _create_runner(self) -> CodexRunner:
+        snapshot = self._snapshot()
+        return CodexRunner(
+            repo=Path(snapshot.repo_root),
+            run_dir=self._run_dir(),
+            binary=self.config.codex_bin,
+            review_model=self.config.review_model,
+            verifier_model=self.config.verifier_model,
+            fixer_model=self.config.fixer_model,
+            reasoning_effort=self.config.reasoning_effort,
+            timeout_seconds=self.config.timeout_seconds,
+            event_callback=self.display.agent_event,
+        )
 
     def _ensure_snapshot(self) -> None:
         ensure_snapshot(
@@ -147,6 +184,7 @@ class ReviewWorkflow:
             output = self._runner().native_review(snapshot.base_sha, label)
         self._ensure_snapshot()
         findings = tuple(parse_native_review(output, Path(snapshot.repo_root)))
+        self._session().record_findings(findings, label)
         self.display.register_findings(findings, phase=label)
         _write_json(
             self._run_dir() / f"{label}.findings.json",
@@ -160,12 +198,6 @@ class ReviewWorkflow:
         history: tuple[Decision, ...],
         phase: str,
     ) -> Decision:
-        if finding.priority > self.config.policy.max_priority:
-            return Decision(
-                finding=finding,
-                verdict=Verdict.NON_BLOCKING,
-                reason="finding is below the configured blocking priority",
-            )
         for previous in history:
             if (
                 previous.finding.finding_id == finding.finding_id
@@ -177,6 +209,8 @@ class ReviewWorkflow:
                     reason=f"already source-refuted in this run: {previous.reason}",
                     challenge=previous.challenge,
                     observation=previous.observation,
+                    adversarial_challenge=previous.adversarial_challenge,
+                    reviewer_response=previous.reviewer_response,
                 )
 
         snapshot = self._snapshot()
@@ -191,6 +225,9 @@ class ReviewWorkflow:
                     schema_name="observation.json",
                 )
                 observation = Observation.from_dict(observed)
+                self._session().record_investigation(
+                    finding, phase, observation=observation
+                )
             self._ensure_snapshot()
             self.display.finding_step(finding, "challenging")
             challenged = self._runner().structured_turn(
@@ -198,8 +235,36 @@ class ReviewWorkflow:
                 prompt=challenge_prompt(snapshot, finding, observation, history),
                 schema_name="challenge.json",
             )
-            challenge = Challenge.from_dict(challenged)
+            adversarial_challenge = Challenge.from_dict(challenged)
+            self._session().record_investigation(
+                finding, phase, adversary=adversarial_challenge
+            )
             self._ensure_snapshot()
+            reviewer_response: Challenge | None = None
+            challenge = adversarial_challenge
+            needs_rebuttal = (
+                adversarial_challenge.assessment in _REBUTTAL_ASSESSMENTS
+                or (
+                    adversarial_challenge.assessment is Assessment.CONFIRMED
+                    and adversarial_challenge.impact
+                    not in {"critical", "high", "moderate"}
+                )
+            )
+            if needs_rebuttal:
+                self.display.finding_step(finding, "debating")
+                response = self._runner().structured_turn(
+                    label=f"{phase}-reviewer-{finding.finding_id}",
+                    prompt=reviewer_reply_prompt(
+                        snapshot, finding, observation, adversarial_challenge
+                    ),
+                    schema_name="challenge.json",
+                )
+                reviewer_response = Challenge.from_dict(response)
+                self._session().record_investigation(
+                    finding, phase, reviewer_response=reviewer_response
+                )
+                challenge = reviewer_response
+                self._ensure_snapshot()
             for previous in history:
                 if (
                     previous.verdict is Verdict.REJECT
@@ -213,8 +278,17 @@ class ReviewWorkflow:
                         reason="the root cause was already source-refuted in this run",
                         challenge=challenge,
                         observation=observation,
+                        adversarial_challenge=adversarial_challenge,
+                        reviewer_response=reviewer_response,
                     )
-            return self.config.policy.decide(finding, challenge, observation, snapshot)
+            decision = self.config.policy.decide(
+                finding, challenge, observation, snapshot
+            )
+            return replace(
+                decision,
+                adversarial_challenge=adversarial_challenge,
+                reviewer_response=reviewer_response,
+            )
         except SnapshotDriftError:
             raise
         except (ReviewReducerError, ValueError, TypeError) as error:
@@ -232,15 +306,12 @@ class ReviewWorkflow:
         *,
         label: str,
     ) -> tuple[Decision, ...]:
-        actionable = sum(
-            finding.priority <= self.config.policy.max_priority for finding in findings
-        )
-        if actionable > self.config.max_findings:
+        if len(findings) > self.config.max_findings:
             raise ReviewReducerError(
-                f"review returned {actionable} potentially blocking findings; "
+                f"review returned {len(findings)} findings; "
                 f"maximum is {self.config.max_findings}"
             )
-        self._progress(f"adjudicating {actionable} potentially blocking findings")
+        self._progress(f"adjudicating {len(findings)} findings")
         with ThreadPoolExecutor(max_workers=self.config.jobs) as executor:
             pending = {
                 executor.submit(self._adjudicate_one, finding, history, label): index
@@ -250,9 +321,15 @@ class ReviewWorkflow:
             for future in as_completed(pending):
                 decision = future.result()
                 ordered[pending[future]] = decision
+                self._session().record_decision(decision, label)
                 self.display.decision(decision)
-            decisions = tuple(decision for decision in ordered if decision is not None)
-        decisions = self.config.policy.deduplicate(decisions)
+            initial_decisions = tuple(
+                decision for decision in ordered if decision is not None
+            )
+        decisions = self.config.policy.deduplicate(initial_decisions)
+        for before, after in zip(initial_decisions, decisions, strict=True):
+            if before != after:
+                self._session().record_decision(after, label)
         for decision in decisions:
             self.display.decision(decision)
         _write_json(
@@ -299,6 +376,13 @@ class ReviewWorkflow:
         accepted = tuple(
             decision for decision in decisions if decision.verdict is Verdict.ACCEPT
         )
+        if not accepted:
+            raise ReviewReducerError("no included findings are available for automatic repair")
+        if any(not decision.auto_fix_allowed for decision in accepted):
+            raise ReviewReducerError(
+                "an included finding does not have a verified, intent-preserving bounded "
+                "fix; run a fresh review or dismiss it before applying this session"
+            )
         self.display.note(
             f"applying one bounded batch of {len(accepted)} verified fixes",
             stage="repair",
@@ -360,10 +444,12 @@ class ReviewWorkflow:
         return result, final_churn.to_dict()
 
     def _finish(self, report: dict[str, Any]) -> dict[str, Any]:
+        report["session_id"] = self._run_dir().name
         report["usage"] = self._runner().usage_summary()
         _write_json(self._run_dir() / "report.json", report)
         summary = format_report(report)
         (self._run_dir() / "summary.md").write_text(summary + "\n", encoding="utf-8")
+        self._session().complete(report)
         return report
 
     def _execute(self) -> dict[str, Any]:
@@ -379,17 +465,8 @@ class ReviewWorkflow:
             )
         self.run_dir = _create_run_dir(self.config, snapshot)
         _write_json(self._run_dir() / "snapshot.json", snapshot.to_dict())
-        self.runner = CodexRunner(
-            repo=Path(snapshot.repo_root),
-            run_dir=self._run_dir(),
-            binary=self.config.codex_bin,
-            review_model=self.config.review_model,
-            verifier_model=self.config.verifier_model,
-            fixer_model=self.config.fixer_model,
-            reasoning_effort=self.config.reasoning_effort,
-            timeout_seconds=self.config.timeout_seconds,
-            event_callback=self.display.agent_event,
-        )
+        self.session = ReviewSession.create(self._run_dir(), snapshot, self.config.mode)
+        self.runner = self._create_runner()
         self.display.note(
             f"reviewing pinned head {snapshot.head_sha[:12]}", stage="review"
         )
@@ -424,24 +501,100 @@ class ReviewWorkflow:
         report["status"] = _status(final_decisions)
         return self._finish(report)
 
-    def run(self) -> dict[str, Any]:
-        with self.display:
-            report = self._execute()
-            self.display.finish(
-                report["status"],
-                {
-                    "clean": "no source-grounded blocking findings remain",
-                    "action_required": "verified findings are ready for a minimal fix",
-                    "human_review_required": "an unresolved severe claim needs human judgment",
-                }[report["status"]],
+    def _apply_saved(self, session: ReviewSession) -> dict[str, Any]:
+        try:
+            report = json.loads((session.run_dir / "report.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ReviewReducerError(
+                f"cannot load the completed saved review report: {error}"
+            ) from error
+        if report.get("repair"):
+            raise ReviewReducerError("this saved session has already applied its repair batch")
+        saved = session.data["snapshot"]
+        current = capture_snapshot(self.config.repo, str(saved["base_ref"]))
+        for name in ("repo_root", "head_sha", "base_sha", "merge_base_sha", "patch_sha256"):
+            if str(getattr(current, name)) != str(saved[name]):
+                raise ReviewReducerError(
+                    f"saved session no longer matches the current {name}; run a fresh review"
+                )
+        if current.dirty_paths or current.untracked_paths:
+            raise ReviewReducerError(
+                "applying a saved session requires a clean working tree; "
+                "commit or stash tracked changes and remove or ignore untracked files first"
             )
-            return report
+        decisions = session.effective_decisions()
+        if any(decision.verdict is Verdict.HUMAN_REVIEW for decision in decisions):
+            raise ReviewReducerError(
+                "resolve findings requiring human review with session include or "
+                "session dismiss before applying this session"
+            )
+        accepted = tuple(
+            decision for decision in decisions if decision.verdict is Verdict.ACCEPT
+        )
+        if not accepted:
+            raise ReviewReducerError("no included findings are available for automatic repair")
+        if any(not decision.auto_fix_allowed for decision in accepted):
+            raise ReviewReducerError(
+                "an included finding does not have a verified, intent-preserving bounded "
+                "fix; run a fresh review or dismiss it before applying this session"
+            )
+        self.snapshot = current
+        self.run_dir = session.run_dir
+        self.session = session
+        self.expected_patch = current.patch_sha256
+        self.expected_untracked = current.untracked_paths
+        self.display.configure(current, "fix")
+        self.runner = self._create_runner()
+        self.session.data["mode"] = "fix"
+        self.session.data["state"] = "running"
+        self.session.save()
+        repair, repair_churn = self._repair(accepted)
+        report["mode"] = "fix"
+        report["repair"] = repair
+        report["repair_churn"] = repair_churn
+        self.display.note("running the single bounded final review", stage="final")
+        final_findings = self._review("final")
+        final_decisions = self._adjudicate(final_findings, decisions, label="final")
+        report["final_findings"] = [finding.to_dict() for finding in final_findings]
+        report["final_decisions"] = [decision.to_dict() for decision in final_decisions]
+        report["status"] = _status(final_decisions)
+        return self._finish(report)
+
+    def _finish_display(self, report: dict[str, Any]) -> dict[str, Any]:
+        self.display.finish(
+            report["status"],
+            {
+                "clean": "no source-grounded findings remain",
+                "action_required": "verified findings are ready for a minimal fix",
+                "human_review_required": "an unresolved finding needs human judgment",
+            }[report["status"]],
+        )
+        return report
+
+    def run(self) -> dict[str, Any]:
+        try:
+            with self.display:
+                return self._finish_display(self._execute())
+        except BaseException as error:
+            if self.session is not None:
+                self.session.fail(str(error))
+            raise
+
+    def apply_session(self, session: ReviewSession) -> dict[str, Any]:
+        try:
+            with self.display:
+                return self._finish_display(self._apply_saved(session))
+        except BaseException as error:
+            if self.session is not None:
+                self.session.fail(str(error))
+            raise
 
 
 def format_report(report: dict[str, Any]) -> str:
     snapshot = report["snapshot"]
     lines = [
         f"Review reducer: {report['status']}",
+        f"Session: {report.get('session_id', Path(report['artifacts_dir']).name)}",
         f"Repository: {snapshot['repo_root']}",
         f"Base: {snapshot['base_ref']} ({snapshot['merge_base_sha'][:12]})",
         f"Head: {snapshot['head_sha'][:12]}",
@@ -479,4 +632,9 @@ def format_report(report: dict[str, Any]) -> str:
             f"{usage['output_tokens']} output"
         )
     lines.append(f"Artifacts: {report['artifacts_dir']}")
+    lines.append(
+        "Inspect: review-reducer session show "
+        f"{report.get('session_id', Path(report['artifacts_dir']).name)} "
+        f"--repo {snapshot['repo_root']}"
+    )
     return "\n".join(lines)

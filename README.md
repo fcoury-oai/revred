@@ -18,9 +18,10 @@ Run the checkout directly:
 For a stacked pull request, set `--base` to its immediate parent branch instead
 of `origin/main`; otherwise inherited parent changes can produce false findings.
 
-Findings are advisory by default. The command exits successfully when no
-source-verified blocking issues survive, exits `2` when verified issues remain,
-and exits `3` when a severe claim requires human judgment.
+Every P0–P3 finding gets the same evidence-grounded review. Priority is retained
+as useful context, but never excludes an issue from investigation. The command
+exits successfully when no consequential verified issues survive, exits `2` when
+verified issues remain, and exits `3` when a claim requires human judgment.
 
 Interactive terminals show a live dashboard with the current review stage,
 parallel Codex agents, recent source-inspection activity, finding decisions,
@@ -50,6 +51,61 @@ plain progress lines. Force or disable the dashboard when necessary:
 
 The dashboard writes only to stderr, so `--json` remains valid JSON on stdout.
 Set `NO_COLOR=1` to preserve the dashboard without ANSI colors.
+
+## Inspect and curate a saved session
+
+Every run immediately creates a durable local session. List the sessions for a
+repository, inspect the latest results, or drill into one finding by its
+1-based number or identifier prefix:
+
+```sh
+./review-reducer session list --repo ~/code/my-project
+./review-reducer session show latest --repo ~/code/my-project
+./review-reducer session show latest --finding 1 --repo ~/code/my-project
+```
+
+A finding's detailed view includes the original native-review comment, the
+independent blind investigation, the adversary's assessment, the original
+reviewer's rebuttal when one was warranted, and the final model decision. Add
+`--json` to any session command for the complete machine-readable evidence.
+
+After inspecting the evidence, explicitly include, dismiss, or reset a finding
+without overwriting the model's original decision:
+
+```sh
+./review-reducer session dismiss latest 1 \
+  --repo ~/code/my-project \
+  --reason 'Behavior already exists on the exact merge base'
+
+./review-reducer session include latest 0504f58a \
+  --repo ~/code/my-project \
+  --reason 'Confirmed user-visible failure is worth the direct fix'
+
+./review-reducer session reset latest 1 --repo ~/code/my-project
+```
+
+Apply the curated findings later as one bounded repair batch followed by one
+final native review:
+
+```sh
+./review-reducer session apply latest --repo ~/code/my-project
+```
+
+The saved repository, HEAD, base, merge base, and complete patch must still
+match. Manually included findings remain ineligible for automatic repair unless
+the saved evidence identifies an intent-preserving direct fix that stays inside
+the same complexity and dependency budgets.
+
+Older artifact directories remain inspectable even when they predate
+`session.json`. To fully investigate findings that an older run skipped, reuse
+its saved native review instead of spending another native-review turn:
+
+```sh
+./review-reducer review \
+  --repo ~/code/my-project \
+  --base origin/main \
+  --review-file /path/to/previous-run/initial.response.txt
+```
 
 To allow one small automatic repair and exactly one final native review:
 
@@ -96,19 +152,23 @@ PYTHONPATH=. python3 -m review_reducer review --repo ~/code/my-project
 1. Pin the target HEAD, exact merge base, complete tracked diff, and original
    production/test churn.
 2. Run Codex's built-in native reviewer in a fresh, ephemeral, read-only session.
-3. For each potentially blocking finding, run a separate blind, read-only Codex
-   session that sees the source location but not the alleged defect.
+3. For every native finding, regardless of priority, run a separate blind,
+   read-only Codex session that sees the source location but not the alleged
+   defect.
 4. Run a fresh adversarial Codex session that receives the finding and blind
    observations. Require exact-base comparison, realistic reachability, concrete
    source anchors, independently evidenced user impact, preservation of the
    pull request's intent, and the smallest direct fix.
-5. Deterministically reject source-refuted inherited, intentional, unreachable,
-   speculative, or duplicate findings. Never silently discard an unproven P0/P1;
-   route it to human review instead.
-6. In `fix` mode only, send surviving findings to one workspace-write Codex
+5. When the adversary believes dismissal or downgrading is genuinely useful,
+   give the original-review perspective one evidence-grounded chance to rebut
+   or concede. Confirmed useful findings do not incur a manufactured debate.
+6. Deterministically reject source-refuted inherited, intentional, unreachable,
+   speculative, or duplicate findings. Route unproven claims of any priority to
+   human review instead of silently discarding them.
+7. In `fix` mode only, send surviving findings to one workspace-write Codex
    session. Reject new files, dependency changes, public APIs, excess production
    lines, and excessive production-file churn.
-7. Run only explicitly requested checks, followed by one final native review and
+8. Run only explicitly requested checks, followed by one final native review and
    the same verification policy. Stop there even if new findings remain.
 
 Native review is intentionally kept separate from structured verification:
@@ -120,7 +180,6 @@ ordinary `codex exec --output-schema` sessions instead.
 
 ```text
 --mode review|fix                 Report only, or apply one verified fix batch.
---max-priority 1                  Treat P0/P1 as blocking; preserve P2/P3 in reports.
 --min-confidence 0.75             Minimum adversarial confidence for automatic fixes.
 --max-added-production-lines 20   Hard limit checked against the actual repair.
 --max-additional-production-files 2
@@ -140,7 +199,12 @@ ordinary `codex exec --output-schema` sessions instead.
 Run artifacts are private to the local user and default to
 `<git-common-dir>/review-reducer/<timestamp>-<head>/`. They include the pinned
 snapshot, role prompts, JSONL events, final model responses, structured
-decisions, measured repair churn, explicit check output, and the final report.
+decisions, measured repair churn, explicit check output, the final report, and a
+continuously updated `session.json` with per-finding evidence and manual
+decision history. Existing artifact directories from older runs can still be
+inspected by passing their path as the session selector; findings that were
+never investigated must be reviewed again before they can be automatically
+repaired.
 The report also records actual per-role input, cached-input, output, and
 reasoning-token usage. Structured roles disable apps, plugins, memories,
 multi-agent spawning, and automatic skill-instruction injection to reduce

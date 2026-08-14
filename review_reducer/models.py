@@ -85,6 +85,18 @@ class Finding:
     def to_dict(self) -> dict[str, Any]:
         return {"finding_id": self.finding_id, **asdict(self)}
 
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "Finding":
+        return cls(
+            title=str(value["title"]),
+            body=str(value["body"]),
+            path=str(value["path"]),
+            line_start=int(value["line_start"]),
+            line_end=int(value["line_end"]),
+            priority=int(value["priority"]),
+            confidence=float(value.get("confidence", 0.0)),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class Observation:
@@ -196,6 +208,8 @@ class Decision:
     reason: str
     challenge: Challenge | None = None
     observation: Observation | None = None
+    adversarial_challenge: Challenge | None = None
+    reviewer_response: Challenge | None = None
     blocks_review: bool = False
     auto_fix_allowed: bool = False
 
@@ -206,9 +220,34 @@ class Decision:
             "reason": self.reason,
             "challenge": self.challenge.to_dict() if self.challenge else None,
             "observation": self.observation.to_dict() if self.observation else None,
+            "adversarial_challenge": (
+                self.adversarial_challenge.to_dict() if self.adversarial_challenge else None
+            ),
+            "reviewer_response": (
+                self.reviewer_response.to_dict() if self.reviewer_response else None
+            ),
             "blocks_review": self.blocks_review,
             "auto_fix_allowed": self.auto_fix_allowed,
         }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "Decision":
+        def challenge(key: str) -> Challenge | None:
+            payload = value.get(key)
+            return Challenge.from_dict(payload) if payload else None
+
+        observation = value.get("observation")
+        return cls(
+            finding=Finding.from_dict(value["finding"]),
+            verdict=Verdict(value["verdict"]),
+            reason=str(value["reason"]),
+            challenge=challenge("challenge"),
+            observation=Observation.from_dict(observation) if observation else None,
+            adversarial_challenge=challenge("adversarial_challenge"),
+            reviewer_response=challenge("reviewer_response"),
+            blocks_review=bool(value.get("blocks_review", False)),
+            auto_fix_allowed=bool(value.get("auto_fix_allowed", False)),
+        )
 
 
 @dataclass(frozen=True, slots=True)

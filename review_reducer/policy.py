@@ -32,7 +32,6 @@ _REFUTATIONS = {
 
 @dataclass(frozen=True, slots=True)
 class ReviewPolicy:
-    max_priority: int = 1
     min_confidence: float = 0.75
     max_added_production_lines: int = 20
     max_additional_production_files: int = 2
@@ -64,8 +63,6 @@ class ReviewPolicy:
         observation: Observation | None,
         snapshot: Snapshot,
     ) -> Decision:
-        severe = finding.priority <= self.max_priority
-
         def result(verdict: Verdict, reason: str) -> Decision:
             return Decision(
                 finding=finding,
@@ -78,10 +75,7 @@ class ReviewPolicy:
             )
 
         def uncertain(reason: str) -> Decision:
-            return result(
-                Verdict.HUMAN_REVIEW if severe else Verdict.NON_BLOCKING,
-                reason,
-            )
+            return result(Verdict.HUMAN_REVIEW, reason)
 
         if challenge.finding_id != finding.finding_id:
             return uncertain("the adversary returned a different finding identifier")
@@ -91,8 +85,6 @@ class ReviewPolicy:
             return uncertain("adversarial confidence is outside the supported range")
         if observation and not 0.0 <= observation.confidence <= 1.0:
             return uncertain("blind-verifier confidence is outside the supported range")
-        if not severe:
-            return result(Verdict.NON_BLOCKING, "finding is below the configured priority")
         if challenge.assessment is Assessment.HUMAN_REQUIRED:
             return uncertain(challenge.rationale or "the finding needs human judgment")
 
@@ -187,6 +179,8 @@ class ReviewPolicy:
                         reason="another accepted finding already covers this root cause",
                         challenge=decision.challenge,
                         observation=decision.observation,
+                        adversarial_challenge=decision.adversarial_challenge,
+                        reviewer_response=decision.reviewer_response,
                     )
                 else:
                     root_causes.add(semantic_id)

@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "summary": {"type": "string"},
+    "applied_finding_ids": {"type": "array", "items": {"type": "string"}},
+    "changed_files": {"type": "array", "items": {"type": "string"}},
+    "checks_run": {"type": "array", "items": {"type": "string"}},
+    "remaining_risks": {"type": "array", "items": {"type": "string"}}
+  },
+  "required": [
+    "summary", "applied_finding_ids", "changed_files", "checks_run", "remaining_risks"
+  ]
+}

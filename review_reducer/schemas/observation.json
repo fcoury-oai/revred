@@ -1,0 +1,33 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "finding_id": {"type": "string"},
+    "changed_behavior": {"type": "string"},
+    "reachable": {"type": "string", "enum": ["yes", "no", "unknown"]},
+    "changed_from_base": {"type": "string", "enum": ["yes", "no", "newly_exposed", "unknown"]},
+    "evidence_kind": {"type": "string", "enum": ["observed", "source_grounded", "inferred", "hypothetical", "unknown"]},
+    "source_anchors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": {"type": "string"},
+          "line": {"type": "integer"},
+          "explanation": {"type": "string"}
+        },
+        "required": ["path", "line", "explanation"]
+      }
+    },
+    "realistic_trigger": {"type": "string"},
+    "user_impact": {"type": "string"},
+    "confidence": {"type": "number"},
+    "uncertainties": {"type": "array", "items": {"type": "string"}}
+  },
+  "required": [
+    "finding_id", "changed_behavior", "reachable", "changed_from_base",
+    "evidence_kind", "source_anchors", "realistic_trigger", "user_impact",
+    "confidence", "uncertainties"
+  ]
+}

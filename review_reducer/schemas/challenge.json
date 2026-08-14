@@ -1,0 +1,51 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "finding_id": {"type": "string"},
+    "assessment": {
+      "type": "string",
+      "enum": ["confirmed", "pre_existing", "intentional", "unreachable", "speculative", "duplicate", "non_blocking", "disproportionate", "human_required"]
+    },
+    "root_cause": {"type": "string"},
+    "rationale": {"type": "string"},
+    "reachable": {"type": "string", "enum": ["yes", "no", "unknown"]},
+    "changed_from_base": {"type": "string", "enum": ["yes", "no", "newly_exposed", "unknown"]},
+    "impact": {"type": "string", "enum": ["critical", "high", "moderate", "low", "unknown"]},
+    "evidence_kind": {"type": "string", "enum": ["observed", "source_grounded", "inferred", "hypothetical", "unknown"]},
+    "source_anchors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": {"type": "string"},
+          "line": {"type": "integer"},
+          "explanation": {"type": "string"}
+        },
+        "required": ["path", "line", "explanation"]
+      }
+    },
+    "realistic_trigger": {"type": "string"},
+    "user_impact": {"type": "string"},
+    "impact_evidence_kind": {
+      "type": "string",
+      "enum": ["observed", "source_grounded", "inferred", "hypothetical", "unknown"]
+    },
+    "smallest_fix": {"type": "string"},
+    "preserves_change_intent": {"type": "boolean"},
+    "confidence": {"type": "number"},
+    "estimated_added_production_lines": {"type": "integer"},
+    "estimated_additional_production_files": {"type": "integer"},
+    "requires_new_dependency": {"type": "boolean"},
+    "requires_new_public_api": {"type": "boolean"}
+  },
+  "required": [
+    "finding_id", "assessment", "root_cause", "rationale", "reachable",
+    "changed_from_base", "impact", "evidence_kind", "source_anchors",
+    "realistic_trigger", "user_impact", "impact_evidence_kind", "smallest_fix",
+    "preserves_change_intent", "confidence",
+    "estimated_added_production_lines", "estimated_additional_production_files",
+    "requires_new_dependency", "requires_new_public_api"
+  ]
+}

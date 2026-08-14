@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Run the checkout directly, including under PYTHONSAFEPATH=1."""
+
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from review_reducer.cli import main
+
+raise SystemExit(main())

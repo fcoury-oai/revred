@@ -52,6 +52,47 @@ plain progress lines. Force or disable the dashboard when necessary:
 The dashboard writes only to stderr, so `--json` remains valid JSON on stdout.
 Set `NO_COLOR=1` to preserve the dashboard without ANSI colors.
 
+## Standalone visual review report
+
+Every completed review writes a polished, self-contained HTML report beside its
+saved session:
+
+```text
+<git-common-dir>/review-reducer/<session-id>/report.html
+```
+
+Interactive terminal runs automatically open the report in your browser after
+the review finishes. Disable that behavior without skipping report generation:
+
+```sh
+./review-reducer review \
+  --repo ~/code/my-project \
+  --base origin/main \
+  --no-open-report
+```
+
+Use `--open-report` to force opening when output is redirected. CI and other
+noninteractive runs otherwise leave the browser closed. The report is a single
+offline HTML file with inline styling, expandable evidence, local source links,
+plain-language issue explanations, user impact, recommended actions, repair
+budgets, model usage, and exact manual-curation commands. It makes no network
+requests, executes no scripts, and requires no additional Codex turns.
+
+Generate or reopen a report for an existing session without repeating its
+review:
+
+```sh
+./review-reducer session report latest --repo ~/code/my-project
+
+./review-reducer session report latest \
+  --repo ~/code/my-project \
+  --output ~/Desktop/review-report.html \
+  --no-open-report
+```
+
+Manual `session include`, `session dismiss`, and `session reset` commands keep
+the session's default HTML report synchronized with your latest decisions.
+
 ## Inspect and curate a saved session
 
 Every run immediately creates a durable local session. List the sessions for a
@@ -192,6 +233,7 @@ ordinary `codex exec --output-schema` sessions instead.
 --artifacts-dir PATH              Store artifacts outside the reviewed working tree.
 --no-blind-verification           Skip the independent blind source investigation.
 --progress auto|always|never      Control the live terminal dashboard.
+--open-report / --no-open-report  Force or disable opening the standalone HTML.
 --check COMMAND                   Run only this explicitly authorized repair check.
 --json                            Emit the complete machine-readable report.
 ```
@@ -199,9 +241,10 @@ ordinary `codex exec --output-schema` sessions instead.
 Run artifacts are private to the local user and default to
 `<git-common-dir>/review-reducer/<timestamp>-<head>/`. They include the pinned
 snapshot, role prompts, JSONL events, final model responses, structured
-decisions, measured repair churn, explicit check output, the final report, and a
+decisions, measured repair churn, explicit check output, the final report, a
 continuously updated `session.json` with per-finding evidence and manual
-decision history. Existing artifact directories from older runs can still be
+decision history, and the standalone visual `report.html`. Existing artifact
+directories from older runs can still be
 inspected by passing their path as the session selector; findings that were
 never investigated must be reviewed again before they can be automatically
 repaired.

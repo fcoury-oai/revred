@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 import json
 from pathlib import Path
@@ -32,6 +32,7 @@ from review_reducer.models import (
     Snapshot,
     Verdict,
 )
+from review_reducer.html_report import write_html_report
 from review_reducer.parsing import parse_native_review
 from review_reducer.policy import ReviewPolicy
 from review_reducer.prompts import (
@@ -446,10 +447,13 @@ class ReviewWorkflow:
     def _finish(self, report: dict[str, Any]) -> dict[str, Any]:
         report["session_id"] = self._run_dir().name
         report["usage"] = self._runner().usage_summary()
+        report["policy"] = asdict(self.config.policy)
+        report["html_report"] = str(self._run_dir() / "report.html")
         _write_json(self._run_dir() / "report.json", report)
         summary = format_report(report)
         (self._run_dir() / "summary.md").write_text(summary + "\n", encoding="utf-8")
         self._session().complete(report)
+        write_html_report(self._session(), report=report)
         return report
 
     def _execute(self) -> dict[str, Any]:
@@ -632,6 +636,8 @@ def format_report(report: dict[str, Any]) -> str:
             f"{usage['output_tokens']} output"
         )
     lines.append(f"Artifacts: {report['artifacts_dir']}")
+    if report.get("html_report"):
+        lines.append(f"HTML report: {report['html_report']}")
     lines.append(
         "Inspect: review-reducer session show "
         f"{report.get('session_id', Path(report['artifacts_dir']).name)} "

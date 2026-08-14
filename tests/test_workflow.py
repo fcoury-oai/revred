@@ -175,6 +175,9 @@ class WorkflowTests(unittest.TestCase):
                          [None, "observation.json", "challenge.json"])
         self.assertIn("return value - 1", (self.fixture.repo / "app.py").read_text())
         self.assertTrue(Path(report["artifacts_dir"], "report.json").is_file())
+        self.assertTrue(Path(report["html_report"]).is_file())
+        self.assertIn("FIX RECOMMENDED", Path(report["html_report"]).read_text())
+        self.assertEqual(report["policy"]["max_added_production_lines"], 20)
 
     def test_preexisting_finding_is_rejected_without_repair(self) -> None:
         with mock.patch.dict(os.environ, {"FAKE_ASSESSMENT": "pre_existing"}):
@@ -453,6 +456,52 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(stdout.getvalue())["manual_override"]["action"], "dismiss")
         self.assertEqual(list_sessions(self.fixture.repo)[0].data["status"], "clean")
+        self.assertIn("DISMISSED", Path(report["html_report"]).read_text())
+
+    def test_saved_session_report_regenerates_without_codex_turns(self) -> None:
+        report = ReviewWorkflow(self.config()).run()
+        original_calls = self.calls()
+        output = self.fixture.root / "shareable-review.html"
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            code = main([
+                "session", "report", "latest", "--repo", str(self.fixture.repo),
+                "--output", str(output), "--no-open-report", "--json",
+            ])
+        self.assertEqual(code, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["html_report"], str(output.resolve()))
+        self.assertEqual(self.calls(), original_calls)
+        self.assertIn("Blind investigation", output.read_text())
+        self.assertIn(report["session_id"], output.read_text())
+
+    def test_html_report_cannot_dirty_reviewed_working_tree(self) -> None:
+        ReviewWorkflow(self.config()).run()
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", stderr):
+            code = main([
+                "session", "report", "latest", "--repo", str(self.fixture.repo),
+                "--output", str(self.fixture.repo / "report.html"), "--no-open-report",
+            ])
+        self.assertEqual(code, 1)
+        self.assertIn("cannot live inside the reviewed working tree", stderr.getvalue())
+        self.assertFalse((self.fixture.repo / "report.html").exists())
+
+    def test_review_no_open_report_preserves_json_stdout(self) -> None:
+        stdout = io.StringIO()
+        with (
+            redirect_stdout(stdout),
+            mock.patch("review_reducer.cli.webbrowser.open") as browser,
+        ):
+            code = main([
+                "review", "--repo", str(self.fixture.repo), "--base", "main",
+                "--codex-bin", str(self.binary), "--jobs", "1", "--json",
+                "--no-open-report",
+            ])
+        self.assertEqual(code, 2)
+        payload = json.loads(stdout.getvalue())
+        self.assertTrue(Path(payload["html_report"]).is_file())
+        browser.assert_not_called()
 
     def test_saved_session_apply_repairs_curated_finding_once(self) -> None:
         report = ReviewWorkflow(self.config()).run()

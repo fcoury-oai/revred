@@ -144,6 +144,8 @@ def _legacy_session(run_dir: Path) -> dict[str, Any]:
         "findings": findings,
         "summary": _summarize(findings),
         "usage": report.get("usage", {}),
+        "policy": report.get("policy", {}),
+        "html_report": report.get("html_report", ""),
         "artifacts_dir": str(run_dir),
         "report_path": str(run_dir / "report.json"),
     }
@@ -175,6 +177,8 @@ class ReviewSession:
                 "findings": [],
                 "summary": _summarize([]),
                 "usage": {},
+                "policy": {},
+                "html_report": "",
                 "artifacts_dir": str(run_dir),
                 "report_path": str(run_dir / "report.json"),
             },
@@ -294,6 +298,8 @@ class ReviewSession:
                     )
             self.data["state"] = "complete"
             self.data["usage"] = report.get("usage", {})
+            self.data["policy"] = report.get("policy", {})
+            self.data["html_report"] = report.get("html_report", "")
             self.data["report_path"] = str(self.run_dir / "report.json")
             self.save()
 

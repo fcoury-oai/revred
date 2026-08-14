@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
@@ -19,6 +21,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import time
 
 argv = sys.argv[1:]
 state_path = Path(os.environ["FAKE_CODEX_STATE"])
@@ -106,7 +109,21 @@ else:
     raise SystemExit(f"unsupported fake invocation: {argv}")
 
 response_path.write_text(response)
-print(json.dumps({"type": "turn.completed"}))
+print(json.dumps({
+    "type": "item.started",
+    "item": {"type": "command_execution", "command": "git diff -- app.py"},
+}), flush=True)
+if os.environ.get("FAKE_CODEX_DELAY"):
+    time.sleep(float(os.environ["FAKE_CODEX_DELAY"]))
+print(json.dumps({
+    "type": "item.completed",
+    "item": {"type": "command_execution", "command": "git diff -- app.py"},
+}), flush=True)
+print(json.dumps({
+    "type": "item.completed",
+    "item": {"type": "agent_message", "text": "Inspecting the exact changed caller contract."},
+}), flush=True)
+print(json.dumps({"type": "turn.completed"}), flush=True)
 '''
 
 
@@ -271,6 +288,43 @@ class WorkflowTests(unittest.TestCase):
                 self.config(artifacts_dir=self.fixture.repo / "reports")
             ).run()
         self.assertFalse(self.state.exists())
+
+    def test_dashboard_keeps_json_stdout_machine_readable(self) -> None:
+        stderr = io.StringIO()
+        stdout = io.StringIO()
+        with mock.patch("sys.stderr", stderr), redirect_stdout(stdout):
+            code = main([
+                "review", "--repo", str(self.fixture.repo), "--base", "main",
+                "--codex-bin", str(self.binary), "--jobs", "1",
+                "--json", "--progress", "always",
+            ])
+        self.assertEqual(code, 2)
+        report = json.loads(stdout.getvalue())
+        self.assertEqual(report["status"], "action_required")
+        self.assertIn("C O D E X   R E V I E W", stderr.getvalue())
+        self.assertIn("\x1b[?25h", stderr.getvalue())
+
+    def test_codex_events_stream_into_dashboard_state(self) -> None:
+        workflow = ReviewWorkflow(self.config())
+        report = workflow.run()
+        self.assertEqual(report["status"], "action_required")
+        self.assertEqual(workflow.display.state.tool_calls, 3)
+        self.assertEqual(workflow.display.state.turns, 3)
+        self.assertTrue(workflow.display.state.agents)
+        self.assertTrue(all(agent.finished for agent in workflow.display.state.agents.values()))
+
+    def test_dashboard_tracks_the_complete_repair_pipeline(self) -> None:
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", stderr):
+            report = ReviewWorkflow(self.config(mode="fix", progress="always")).run()
+        self.assertEqual(report["status"], "clean")
+        dashboard = stderr.getvalue()
+        self.assertIn("✓ review", dashboard)
+        self.assertIn("✓ challenge", dashboard)
+        self.assertIn("✓ repair", dashboard)
+        self.assertIn("✓ final", dashboard)
+        self.assertIn("CLEAN", dashboard)
+        self.assertIn("5 source checks", dashboard)
 
 
 if __name__ == "__main__":

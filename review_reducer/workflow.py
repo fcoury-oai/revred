@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 import json
 from pathlib import Path
 import shlex
 import subprocess
-import sys
 from typing import Any
 
 from review_reducer.codex import CodexRunner
+from review_reducer.display import ProgressDisplay
 from review_reducer.errors import BudgetExceededError, ReviewReducerError, SnapshotDriftError
 from review_reducer.git import (
     capture_snapshot,
@@ -53,6 +53,7 @@ class RunConfig:
     max_findings: int = 12
     blind_verification: bool = True
     checks: tuple[str, ...] = ()
+    progress: str = "auto"
     policy: ReviewPolicy = field(default_factory=ReviewPolicy)
 
 
@@ -109,9 +110,10 @@ class ReviewWorkflow:
         self.runner: CodexRunner | None = None
         self.expected_patch: str | None = None
         self.expected_untracked: tuple[str, ...] | None = None
+        self.display = ProgressDisplay(mode=config.progress)
 
     def _progress(self, message: str) -> None:
-        print(f"review-reducer: {message}", file=sys.stderr, flush=True)
+        self.display.note(message)
 
     def _runner(self) -> CodexRunner:
         assert self.runner is not None
@@ -145,6 +147,7 @@ class ReviewWorkflow:
             output = self._runner().native_review(snapshot.base_sha, label)
         self._ensure_snapshot()
         findings = tuple(parse_native_review(output, Path(snapshot.repo_root)))
+        self.display.register_findings(findings, phase=label)
         _write_json(
             self._run_dir() / f"{label}.findings.json",
             [finding.to_dict() for finding in findings],
@@ -181,6 +184,7 @@ class ReviewWorkflow:
             self._ensure_snapshot()
             observation: Observation | None = None
             if self.config.blind_verification:
+                self.display.finding_step(finding, "investigating")
                 observed = self._runner().structured_turn(
                     label=f"{phase}-blind-{finding.finding_id}",
                     prompt=blind_prompt(snapshot, finding),
@@ -188,6 +192,7 @@ class ReviewWorkflow:
                 )
                 observation = Observation.from_dict(observed)
             self._ensure_snapshot()
+            self.display.finding_step(finding, "challenging")
             challenged = self._runner().structured_turn(
                 label=f"{phase}-defense-{finding.finding_id}",
                 prompt=challenge_prompt(snapshot, finding, observation, history),
@@ -237,13 +242,19 @@ class ReviewWorkflow:
             )
         self._progress(f"adjudicating {actionable} potentially blocking findings")
         with ThreadPoolExecutor(max_workers=self.config.jobs) as executor:
-            decisions = tuple(
-                executor.map(
-                    lambda finding: self._adjudicate_one(finding, history, label),
-                    findings,
-                )
-            )
+            pending = {
+                executor.submit(self._adjudicate_one, finding, history, label): index
+                for index, finding in enumerate(findings)
+            }
+            ordered: list[Decision | None] = [None] * len(findings)
+            for future in as_completed(pending):
+                decision = future.result()
+                ordered[pending[future]] = decision
+                self.display.decision(decision)
+            decisions = tuple(decision for decision in ordered if decision is not None)
         decisions = self.config.policy.deduplicate(decisions)
+        for decision in decisions:
+            self.display.decision(decision)
         _write_json(
             self._run_dir() / f"{label}.decisions.json",
             [decision.to_dict() for decision in decisions],
@@ -288,7 +299,10 @@ class ReviewWorkflow:
         accepted = tuple(
             decision for decision in decisions if decision.verdict is Verdict.ACCEPT
         )
-        self._progress(f"applying one bounded batch of {len(accepted)} verified fixes")
+        self.display.note(
+            f"applying one bounded batch of {len(accepted)} verified fixes",
+            stage="repair",
+        )
         result = self._runner().structured_turn(
             label="repair",
             prompt=fix_prompt(
@@ -352,9 +366,10 @@ class ReviewWorkflow:
         (self._run_dir() / "summary.md").write_text(summary + "\n", encoding="utf-8")
         return report
 
-    def run(self) -> dict[str, Any]:
+    def _execute(self) -> dict[str, Any]:
         self.snapshot = capture_snapshot(self.config.repo, self.config.base)
         snapshot = self._snapshot()
+        self.display.configure(snapshot, self.config.mode)
         self.expected_patch = snapshot.patch_sha256
         self.expected_untracked = snapshot.untracked_paths
         if self.config.mode == "fix" and (snapshot.dirty_paths or snapshot.untracked_paths):
@@ -373,8 +388,11 @@ class ReviewWorkflow:
             fixer_model=self.config.fixer_model,
             reasoning_effort=self.config.reasoning_effort,
             timeout_seconds=self.config.timeout_seconds,
+            event_callback=self.display.agent_event,
         )
-        self._progress(f"reviewing pinned head {snapshot.head_sha[:12]}")
+        self.display.note(
+            f"reviewing pinned head {snapshot.head_sha[:12]}", stage="review"
+        )
         initial_findings = self._review("initial", self.config.review_file)
         initial_decisions = self._adjudicate(initial_findings, label="initial")
         report: dict[str, Any] = {
@@ -396,7 +414,7 @@ class ReviewWorkflow:
         repair, repair_churn = self._repair(initial_decisions)
         report["repair"] = repair
         report["repair_churn"] = repair_churn
-        self._progress("running the single bounded final review")
+        self.display.note("running the single bounded final review", stage="final")
         final_findings = self._review("final")
         final_decisions = self._adjudicate(
             final_findings, initial_decisions, label="final"
@@ -405,6 +423,19 @@ class ReviewWorkflow:
         report["final_decisions"] = [decision.to_dict() for decision in final_decisions]
         report["status"] = _status(final_decisions)
         return self._finish(report)
+
+    def run(self) -> dict[str, Any]:
+        with self.display:
+            report = self._execute()
+            self.display.finish(
+                report["status"],
+                {
+                    "clean": "no source-grounded blocking findings remain",
+                    "action_required": "verified findings are ready for a minimal fix",
+                    "human_review_required": "an unresolved severe claim needs human judgment",
+                }[report["status"]],
+            )
+            return report
 
 
 def format_report(report: dict[str, Any]) -> str:

@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 import subprocess
 import threading
-from typing import Any
+from typing import Any, Callable
 
 from review_reducer.errors import CodexInvocationError, InvalidReviewError
 
@@ -67,6 +67,7 @@ class CodexRunner:
     fixer_model: str | None = None
     reasoning_effort: str | None = None
     timeout_seconds: int = 1200
+    event_callback: Callable[[str, dict[str, Any]], None] | None = None
     _command_lock: threading.Lock = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -85,6 +86,7 @@ class CodexRunner:
     def _invoke(self, label: str, command: list[str], prompt: str | None) -> str:
         response_path = self.run_dir / f"{label}.response.txt"
         events_path = self.run_dir / f"{label}.events.jsonl"
+        stderr_path = self.run_dir / f"{label}.stderr.txt"
         if prompt is not None:
             (self.run_dir / f"{label}.prompt.txt").write_text(prompt, encoding="utf-8")
         command.extend(["--output-last-message", str(response_path)])
@@ -92,35 +94,82 @@ class CodexRunner:
             with (self.run_dir / "commands.jsonl").open("a", encoding="utf-8") as log:
                 log.write(json.dumps({"role": label, "argv": command}) + "\n")
         try:
-            with events_path.open("w", encoding="utf-8") as events:
-                result = subprocess.run(
-                    command,
-                    cwd=self.repo,
-                    text=True,
-                    input=prompt,
-                    stdout=events,
-                    stderr=subprocess.PIPE,
-                    check=False,
-                    timeout=self.timeout_seconds,
-                )
+            process = subprocess.Popen(
+                command,
+                cwd=self.repo,
+                text=True,
+                stdin=subprocess.PIPE if prompt is not None else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=1,
+            )
         except FileNotFoundError as error:
             raise CodexInvocationError(f"Codex executable not found: {self.binary}") from error
+        self._emit(label, {"type": "reducer.agent.started"})
+        stderr_chunks: list[str] = []
+
+        def read_events() -> None:
+            assert process.stdout is not None
+            with process.stdout as source, events_path.open("w", encoding="utf-8") as output:
+                for line in source:
+                    output.write(line)
+                    output.flush()
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(event, dict):
+                        self._emit(label, event)
+
+        def read_stderr() -> None:
+            assert process.stderr is not None
+            with process.stderr as source, stderr_path.open("w", encoding="utf-8") as output:
+                for line in source:
+                    stderr_chunks.append(line)
+                    output.write(line)
+                    output.flush()
+
+        stdout_thread = threading.Thread(target=read_events, daemon=True)
+        stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+        stdout_thread.start()
+        stderr_thread.start()
+        try:
+            if prompt is not None:
+                assert process.stdin is not None
+                process.stdin.write(prompt)
+                process.stdin.close()
+            returncode = process.wait(timeout=self.timeout_seconds)
         except subprocess.TimeoutExpired as error:
+            process.kill()
+            process.wait()
+            self._emit(label, {"type": "reducer.agent.failed"})
             raise CodexInvocationError(
                 f"Codex {label} exceeded the {self.timeout_seconds}s timeout"
             ) from error
-        stderr_path = self.run_dir / f"{label}.stderr.txt"
-        stderr_path.write_text(result.stderr or "", encoding="utf-8")
-        if result.returncode:
-            detail = (result.stderr or "").strip().splitlines()
-            message = detail[-1] if detail else f"exit status {result.returncode}"
+        except BaseException:
+            process.kill()
+            process.wait()
+            self._emit(label, {"type": "reducer.agent.failed"})
+            raise
+        finally:
+            stdout_thread.join(timeout=2.0)
+            stderr_thread.join(timeout=2.0)
+        if returncode:
+            self._emit(label, {"type": "reducer.agent.failed"})
+            detail = "".join(stderr_chunks).strip().splitlines()
+            message = detail[-1] if detail else f"exit status {returncode}"
             raise CodexInvocationError(f"Codex {label} failed: {message}")
+        self._emit(label, {"type": "reducer.agent.finished"})
         if not response_path.is_file():
             raise InvalidReviewError(f"Codex {label} did not produce a final response")
         response = response_path.read_text(encoding="utf-8").strip()
         if not response:
             raise InvalidReviewError(f"Codex {label} produced an empty final response")
         return response
+
+    def _emit(self, label: str, event: dict[str, Any]) -> None:
+        if self.event_callback:
+            self.event_callback(label, event)
 
     def native_review(self, base_ref: str, label: str) -> str:
         command = [

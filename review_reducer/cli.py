@@ -40,6 +40,12 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--reasoning-effort", choices=("low", "medium", "high", "xhigh"))
     review.add_argument("--no-blind-verification", action="store_true")
     review.add_argument(
+        "--progress",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="live terminal dashboard behavior (default: auto)",
+    )
+    review.add_argument(
         "--check",
         action="append",
         default=[],
@@ -82,6 +88,7 @@ def main(argv: list[str] | None = None) -> int:
         max_findings=options.max_findings,
         blind_verification=not options.no_blind_verification,
         checks=tuple(options.check),
+        progress=options.progress,
         policy=ReviewPolicy(
             max_priority=options.max_priority,
             min_confidence=options.min_confidence,

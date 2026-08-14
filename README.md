@@ -22,6 +22,35 @@ Findings are advisory by default. The command exits successfully when no
 source-verified blocking issues survive, exits `2` when verified issues remain,
 and exits `3` when a severe claim requires human judgment.
 
+Interactive terminals show a live dashboard with the current review stage,
+parallel Codex agents, recent source-inspection activity, finding decisions,
+elapsed time, and token usage. Redirected output automatically falls back to
+plain progress lines. Force or disable the dashboard when necessary:
+
+```text
+╭──────────────────────────────────────────────────────────────────────────╮
+│ ◈  C O D E X   R E V I E W   R E D U C E R             ⠹ LIVE  00:18     │
+│ PIPELINE                                                                │
+│ ✓ review   ⠹ challenge   ○ repair   ○ final                             │
+│                                                                         │
+│ ACTIVE AGENTS                                                           │
+│ ⠹ adversarial review · src/app.py:42                                    │
+│   Comparing the changed caller contract against the exact merge base.   │
+│                                                                         │
+│ FINDINGS  3 found   1 accepted   1 rejected   0 human                   │
+│ ✓ P1 Existing guard already rejects invalid input  [REJECTED]           │
+│ ⠹ P1 Preserve caller contract  [CHALLENGING]                           │
+╰──────────────────────────────────────────────────────────────────────────╯
+```
+
+```sh
+./review-reducer review --repo ~/code/my-project --progress always
+./review-reducer review --repo ~/code/my-project --progress never
+```
+
+The dashboard writes only to stderr, so `--json` remains valid JSON on stdout.
+Set `NO_COLOR=1` to preserve the dashboard without ANSI colors.
+
 To allow one small automatic repair and exactly one final native review:
 
 ```sh
@@ -103,6 +132,7 @@ ordinary `codex exec --output-schema` sessions instead.
 --review-file PATH                Reuse an existing rendered or JSON-shaped review.
 --artifacts-dir PATH              Store artifacts outside the reviewed working tree.
 --no-blind-verification           Skip the independent blind source investigation.
+--progress auto|always|never      Control the live terminal dashboard.
 --check COMMAND                   Run only this explicitly authorized repair check.
 --json                            Emit the complete machine-readable report.
 ```
